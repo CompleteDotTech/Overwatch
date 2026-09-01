@@ -307,6 +307,14 @@ def build_sky_only_record(
     retry_error: str | None,
     zymtrace_project_id: str,
 ) -> dict[str, Any]:
+    wandb_url = next(
+        (
+            url
+            for label, url in (job.links or {}).items()
+            if "w&b" in label.casefold() or "wandb" in label.casefold()
+        ),
+        None,
+    )
     completed_batches = log_progress.get("completed_batches") if log_progress else None
     total_batches = log_progress.get("total_batches") if log_progress else None
     elapsed_seconds = job.job_duration
@@ -334,7 +342,7 @@ def build_sky_only_record(
         "name": job.job_name,
         "project": None,
         "user": job.user_name,
-        "wandb_id": None,
+        "wandb_id": wandb_url.rstrip("/").rsplit("/", 1)[-1] if wandb_url else None,
         "submitted_at": isoformat(timestamp_from_epoch(job.submitted_at)),
         "status": {"wandb": None, "skypilot": enum_value(job.status)},
         "progress": {
@@ -412,7 +420,7 @@ def build_sky_only_record(
         },
         "storage": {"config_uri": None, "run_uri": None, "gcp_bucket": None},
         "links": {
-            "wandb": None,
+            "wandb": wandb_url,
             "skypilot": f"{sky_server_common.get_server_url()}/dashboard/jobs/{job.job_id}",
             "zymtrace": zymtrace_url(zymtrace_project_id, job.job_name, started_at),
             "gcp_bucket": None,

@@ -24,13 +24,15 @@ from importlib.resources import files
 from pathlib import Path
 from time import perf_counter
 from typing import Any
+from urllib.parse import urlparse
 
 import boto3
 import wandb
 from aiohttp import web
 from botocore.exceptions import ClientError
 from dotenv import load_dotenv
-from watchfiles import awatch
+from loguru import logger
+from watchfiles import DefaultFilter, run_process
 
 from overwatch.constants import (
     ACTIVE_RESOURCE_STATUSES,
@@ -46,6 +48,7 @@ from overwatch.logs import (
     progress_and_retries_from_job_log,
     resolve_cloudwatch_stream_name,
 )
+from overwatch.providers.billing import collect_daily_cloud_spend
 from overwatch.providers.sky import collect_managed_jobs, collect_standalone_clusters
 from overwatch.providers.wandb_flow import collect_recent_flow_runs, match_skypilot_jobs
 from overwatch.report import (
@@ -54,7 +57,57 @@ from overwatch.report import (
     build_sky_only_record,
 )
 from overwatch.utils import enum_value, isoformat
-from overwatch.view import config_differences, render_html
+from overwatch.view import config_differences
+
+
+def build_frontend_assets_if_sources_are_newer() -> None:
+    repository_root = Path(__file__).resolve().parents[2]
+    package_json = repository_root / "package.json"
+    frontend_index = Path(files("overwatch").joinpath("static", "dist", "index.html"))
+    if not package_json.exists():
+        if not frontend_index.exists():
+            raise RuntimeError("Packaged React frontend assets are missing")
+        return
+
+    frontend_source = Path(__file__).parent / "frontend"
+    frontend_inputs = [
+        path
+        for path in (
+            *frontend_source.rglob("*"),
+            package_json,
+            repository_root / "package-lock.json",
+            repository_root / "vite.config.ts",
+            repository_root / "tsconfig.app.json",
+        )
+        if path.is_file()
+    ]
+    newest_input_mtime = max(path.stat().st_mtime for path in frontend_inputs)
+    if frontend_index.exists() and frontend_index.stat().st_mtime >= newest_input_mtime:
+        return
+
+    logger.info("Building the React frontend…")
+    try:
+        subprocess.run(["npm", "run", "build"], cwd=repository_root, check=True)
+    except subprocess.CalledProcessError:
+        if not frontend_index.exists():
+            raise
+        logger.exception(
+            "Frontend build failed; keeping the last successful build online."
+        )
+
+
+def configure_colored_logging() -> None:
+    logger.remove()
+    logger.add(
+        sys.stderr,
+        colorize=True,
+        format=(
+            "<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | "
+            "<level>{message}</level>"
+        ),
+        backtrace=False,
+        diagnose=False,
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -86,6 +139,13 @@ def parse_args() -> argparse.Namespace:
         help="skip CloudWatch/SkyPilot log enrichment",
     )
     parser.add_argument(
+        "--gcp-billing-table",
+        help=(
+            "GCP standard billing export as project.dataset.table "
+            "(default: GCP_BILLING_EXPORT_TABLE)"
+        ),
+    )
+    parser.add_argument(
         "--no-reload", action="store_true", help="disable source-code auto reload"
     )
     parser.add_argument("--zymtrace-project-id", default=DEFAULT_ZYMTRACE_PROJECT_ID)
@@ -111,48 +171,77 @@ async def collect_report(
     if uv_env_file := os.environ.get("UV_ENV_FILE"):
         load_dotenv(uv_env_file)
     if log_progress:
-        print(
-            "[startup] Loading the complete SkyPilot job and cluster inventory…",
-            flush=True,
-        )
-    jobs, clusters = await asyncio.gather(
+        logger.info("Loading the complete SkyPilot job and cluster inventory…")
+    jobs, clusters, billing = await asyncio.gather(
         asyncio.to_thread(collect_managed_jobs),
         asyncio.to_thread(collect_standalone_clusters),
+        asyncio.to_thread(
+            collect_daily_cloud_spend,
+            getattr(args, "gcp_billing_table", None)
+            or os.environ.get("GCP_BILLING_EXPORT_TABLE"),
+        ),
     )
     if log_progress:
-        print(
-            f"[startup] Found {len(jobs)} managed jobs and {len(clusters)} standalone clusters "
-            f"({perf_counter() - collection_started:.1f}s).",
-            flush=True,
+        logger.info(
+            "Found {} managed jobs and {} standalone clusters ({:.1f}s).",
+            len(jobs),
+            len(clusters),
+            perf_counter() - collection_started,
         )
 
     # W&B is optional enrichment: a telemetry failure must never remove Sky resources.
-    global_warnings = []
+    global_warnings = list(billing["warnings"])
     wandb_started = perf_counter()
     if log_progress:
-        print(
-            f"[startup] Loading up to {args.limit} recent W&B training runs for enrichment…",
-            flush=True,
+        logger.info(
+            "Loading up to {} recent W&B training runs for enrichment…", args.limit
         )
     try:
         api = await asyncio.to_thread(wandb.Api, timeout=30)
         entity = args.entity or api.default_entity
         runs = await collect_recent_flow_runs(api, entity, args.limit)
+
+        # Hydrate scheduler-advertised runs even after they age out of the recent-run window.
+        selected_wandb_ids = {run.id for run in runs}
+        linked_wandb_paths = set()
+        for job in jobs:
+            for linked_url in (job.links or {}).values():
+                parsed_url = urlparse(linked_url)
+                path_parts = parsed_url.path.strip("/").split("/")
+                if (
+                    parsed_url.hostname in {"wandb.ai", "app.wandb.ai"}
+                    and len(path_parts) >= 4
+                    and path_parts[-2] == "runs"
+                    and path_parts[-1] not in selected_wandb_ids
+                ):
+                    linked_wandb_paths.add(
+                        f"{path_parts[-4]}/{path_parts[-3]}/{path_parts[-1]}"
+                    )
+        linked_wandb_results = await asyncio.gather(
+            *(
+                asyncio.to_thread(api.run, linked_wandb_path)
+                for linked_wandb_path in linked_wandb_paths
+            ),
+            return_exceptions=True,
+        )
+        runs.extend(
+            linked_run
+            for linked_run in linked_wandb_results
+            if not isinstance(linked_run, BaseException)
+            and linked_run.config.get("_id_") == "TrainConfig"
+        )
     # W&B is non-authoritative; any client failure must leave cloud inventory visible.
     except Exception as error:  # noqa: BLE001
         runs = []
         entity = args.entity
         global_warnings.append(f"Could not collect W&B enrichment: {error}")
         if log_progress:
-            print(
-                f"[startup] W&B enrichment is unavailable: {error}",
-                file=sys.stderr,
-                flush=True,
-            )
+            logger.warning("W&B enrichment is unavailable: {}", error)
     if log_progress:
-        print(
-            f"[startup] W&B enrichment returned {len(runs)} runs ({perf_counter() - wandb_started:.1f}s).",
-            flush=True,
+        logger.info(
+            "W&B enrichment returned {} runs ({:.1f}s).",
+            len(runs),
+            perf_counter() - wandb_started,
         )
 
     matched_jobs = match_skypilot_jobs(runs, jobs)
@@ -170,7 +259,7 @@ async def collect_report(
             if jobs_for_progress
             else "Skipping log enrichment"
         )
-        print(f"[startup] {message}…", flush=True)
+        logger.info("{}…", message)
     cloudwatch_client = boto3.client("logs", region_name=CLOUDWATCH_REGION)
     log_semaphore = asyncio.Semaphore(8)
     log_values, retry_values = await asyncio.gather(
@@ -190,10 +279,7 @@ async def collect_report(
     log_results = dict(zip(jobs_for_progress, log_values))
     retry_results = dict(zip(jobs_for_progress, retry_values))
     if log_progress:
-        print(
-            f"[startup] Log enrichment finished ({perf_counter() - log_started:.1f}s).",
-            flush=True,
-        )
+        logger.info("Log enrichment finished ({:.1f}s).", perf_counter() - log_started)
 
     records = []
     matched_runs_by_job_id = {
@@ -250,8 +336,9 @@ async def collect_report(
         "generated_at": isoformat(datetime.now(UTC)),
         "wandb_entity": entity,
         "requested_limit": args.limit,
-        "selection": "all SkyPilot managed jobs and standalone clusters, optionally enriched with training data",
+        "selection": "active and recent SkyPilot jobs and standalone clusters, optionally enriched with training data",
         "log_enrichment": not args.no_log_enrichment,
+        "billing": billing,
         "resources": records,
         "config_differences": differences,
         "warnings": global_warnings,
@@ -259,13 +346,17 @@ async def collect_report(
 
 
 async def handle_index(request: web.Request) -> web.Response:
-    return web.Response(
-        text=render_html(request.app["state"]["report"]), content_type="text/html"
-    )
+    frontend_index = Path(files("overwatch").joinpath("static", "dist", "index.html"))
+    return web.FileResponse(frontend_index)
 
 
 async def handle_report_json(request: web.Request) -> web.Response:
-    return web.json_response(request.app["state"]["report"])
+    state = request.app["state"]
+    if state["report"] is None:
+        return web.json_response(
+            {"ready": False, "error": state["report_error"]}, status=202
+        )
+    return web.json_response(state["report"])
 
 
 async def handle_health(request: web.Request) -> web.Response:
@@ -273,20 +364,27 @@ async def handle_health(request: web.Request) -> web.Response:
     return web.json_response(
         {
             "startup_id": state["startup_id"],
-            "report_version": state["report"]["generated_at"],
+            "report_version": (
+                state["report"]["generated_at"] if state["report"] else None
+            ),
         }
     )
 
 
 async def handle_log_stream(request: web.Request) -> web.StreamResponse:
     job_id = int(request.match_info["job_id"])
-    record = next(
-        (
-            record
-            for record in request.app["state"]["report"]["resources"]
-            if record["skypilot"]["job_id"] == job_id
-        ),
-        None,
+    report = request.app["state"]["report"]
+    record = (
+        next(
+            (
+                record
+                for record in report["resources"]
+                if record["skypilot"]["job_id"] == job_id
+            ),
+            None,
+        )
+        if report
+        else None
     )
     if record is None or not record["skypilot"].get("cluster_name"):
         raise web.HTTPNotFound(text="CloudWatch logs are unavailable for this job")
@@ -352,6 +450,7 @@ async def refresh_report_forever(
         await asyncio.sleep(args.refresh_interval)
         try:
             app["state"]["report"] = await collect_report(args)
+            app["state"]["report_error"] = None
         except (
             ClientError,
             OSError,
@@ -359,32 +458,29 @@ async def refresh_report_forever(
             ValueError,
             wandb.errors.Error,
         ) as error:
-            print(
-                f"Report refresh failed; retrying in {args.refresh_interval:g}s: {error}",
-                file=sys.stderr,
+            app["state"]["report_error"] = str(error)
+            logger.error(
+                "Report refresh failed; retrying in {:g}s: {}",
+                args.refresh_interval,
+                error,
             )
-
-
-async def restart_when_source_changes(args: argparse.Namespace) -> None:
-    async for _changes in awatch(Path(__file__).parent):
-        os.environ["FLOW_MONITOR_RESTARTED"] = "1"
-        os.execv(sys.executable, [sys.executable, "-m", "overwatch.cli", *sys.argv[1:]])
 
 
 async def run_service(args: argparse.Namespace) -> int:
     service_started = perf_counter()
     url = f"http://{args.host}:{args.port}"
-    print(
-        f"Starting Overwatch at {url}; building the initial report before accepting connections.",
-        flush=True,
-    )
-    report = await collect_report(args, log_progress=True)
+    await asyncio.to_thread(build_frontend_assets_if_sources_are_newer)
     app = web.Application()
-    app["state"] = {"startup_id": uuid.uuid4().hex, "report": report}
-    app["cloudwatch_client"] = boto3.client("logs", region_name=CLOUDWATCH_REGION)
+    app["state"] = {
+        "startup_id": uuid.uuid4().hex,
+        "report": None,
+        "report_error": None,
+    }
     app.add_routes(
         [
             web.get("/", handle_index),
+            web.get("/billing", handle_index),
+            web.get("/cost-waste", handle_index),
             web.get("/api/report", handle_report_json),
             web.get("/api/health", handle_health),
             web.get("/api/logs/{job_id:\\d+}", handle_log_stream),
@@ -394,32 +490,49 @@ async def run_service(args: argparse.Namespace) -> int:
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
     await web.TCPSite(runner, args.host, args.port).start()
-    print(
-        f"Overwatch is ready at {url} with {len(report['resources'])} cloud resources "
-        f"({perf_counter() - service_started:.1f}s)."
+    logger.success(
+        "Overwatch UI is ready at {} ({:.1f}s); loading cloud inventory…",
+        url,
+        perf_counter() - service_started,
     )
-    print(
+    logger.info(
         "Auto-reload is enabled." if not args.no_reload else "Auto-reload is disabled."
     )
-    print("Press Ctrl-C to stop it.")
+    logger.info("Press Ctrl-C to stop it.")
 
     # Open Chrome once; a source reload keeps the existing browser tab alive.
-    was_restarted = os.environ.pop("FLOW_MONITOR_RESTARTED", None) is not None
+    was_restarted = os.environ.get("WATCHFILES_CHANGES", "[]") != "[]"
     if not args.no_open and not was_restarted:
         try:
             await asyncio.to_thread(
                 subprocess.run, ["open", "-a", "Google Chrome", url], check=True
             )
         except (OSError, subprocess.CalledProcessError) as error:
-            print(
-                f"Could not open Chrome ({error}); open {url} manually.",
-                file=sys.stderr,
-            )
+            logger.warning("Could not open Chrome ({}); open {} manually.", error, url)
 
-    background_tasks = [asyncio.create_task(refresh_report_forever(app, args))]
-    if not args.no_reload:
-        background_tasks.append(asyncio.create_task(restart_when_source_changes(args)))
+    background_tasks = []
     try:
+        app["cloudwatch_client"] = boto3.client("logs", region_name=CLOUDWATCH_REGION)
+        try:
+            report = await collect_report(args, log_progress=True)
+            app["state"]["report"] = report
+            logger.success(
+                "Cloud inventory is ready with {} resources ({:.1f}s).",
+                len(report["resources"]),
+                perf_counter() - service_started,
+            )
+        except (
+            ClientError,
+            OSError,
+            RuntimeError,
+            ValueError,
+            wandb.errors.Error,
+        ) as error:
+            app["state"]["report_error"] = str(error)
+            logger.error(
+                "Initial report failed; background refresh will retry: {}", error
+            )
+        background_tasks.append(asyncio.create_task(refresh_report_forever(app, args)))
         await asyncio.Event().wait()
     finally:
         for task in background_tasks:
@@ -429,11 +542,42 @@ async def run_service(args: argparse.Namespace) -> int:
     return 0
 
 
-def main() -> int:
+def run_service_worker(args: argparse.Namespace) -> None:
+    """Run one supervised service generation."""
+    configure_colored_logging()
     try:
-        return asyncio.run(run_service(parse_args()))
+        asyncio.run(run_service(args))
     except KeyboardInterrupt:
-        return 0
+        pass
+
+
+def log_detected_source_changes(changes: set[tuple[Any, str]]) -> None:
+    logger.info("Detected {} source change(s); relaunching Overwatch…", len(changes))
+
+
+def main() -> int:
+    configure_colored_logging()
+    args = parse_args()
+    if args.no_reload:
+        try:
+            return asyncio.run(run_service(args))
+        except KeyboardInterrupt:
+            return 0
+
+    watch_root = Path(__file__).parent
+    logger.info("Auto-reload supervisor is watching {}.", watch_root)
+    try:
+        run_process(
+            watch_root,
+            target=run_service_worker,
+            args=(args,),
+            target_type="function",
+            callback=log_detected_source_changes,
+            watch_filter=DefaultFilter(ignore_paths=(watch_root / "static",)),
+        )
+    except KeyboardInterrupt:
+        pass
+    return 0
 
 
 if __name__ == "__main__":

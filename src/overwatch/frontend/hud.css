@@ -1,0 +1,224 @@
+:root {
+  --hud-orange: #fa9c1e;
+  --hud-orange-bright: #ffb84d;
+  --hud-blue: #38a9ff;
+  --hud-success: #5fd38d;
+  --hud-cut: 12px;
+}
+
+:root[data-mantine-color-scheme="light"] {
+  --hud-body: #e7ebee;
+  --hud-panel: rgb(250 252 253 / 92%);
+  --hud-panel-raised: #ffffff;
+  --hud-border: #aeb6bd;
+  --hud-border-soft: #d1d6da;
+  --hud-grid: rgb(48 58 66 / 7%);
+  --hud-header: rgb(240 244 246 / 94%);
+  --hud-shadow: 0 12px 28px rgb(31 38 43 / 10%);
+}
+
+:root[data-mantine-color-scheme="dark"] {
+  --hud-body: #0e1114;
+  --hud-panel: rgb(24 29 34 / 94%);
+  --hud-panel-raised: #1c2228;
+  --hud-border: #46515b;
+  --hud-border-soft: #2e3841;
+  --hud-grid: rgb(145 164 179 / 6%);
+  --hud-header: rgb(13 17 20 / 95%);
+  --hud-shadow: 0 16px 36px rgb(0 0 0 / 28%);
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  background-color: var(--hud-body);
+  background-image:
+    linear-gradient(var(--hud-grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--hud-grid) 1px, transparent 1px),
+    radial-gradient(circle at 85% 5%, rgb(250 156 30 / 10%), transparent 28rem);
+  background-size: 32px 32px, 32px 32px, auto;
+}
+
+.hud-header {
+  background: var(--hud-header);
+  border-bottom: 2px solid var(--hud-orange);
+  box-shadow: 0 6px 24px rgb(0 0 0 / 12%);
+  backdrop-filter: blur(14px);
+}
+
+.hud-logo {
+  background: transparent;
+  border: 0;
+}
+
+.hud-logo img {
+  filter: drop-shadow(0 0 7px rgb(250 156 30 / 35%));
+}
+
+.hud-brand {
+  font-family: "Avenir Next Condensed", "Arial Narrow", sans-serif;
+  font-size: 1.05rem;
+  font-style: italic;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.hud-brand::after {
+  color: var(--hud-orange);
+  content: " // OPS";
+  font-size: 0.72em;
+  margin-left: 0.25rem;
+}
+
+.hud-main {
+  width: 100%;
+}
+
+.mantine-Title-root {
+  font-family: "Avenir Next Condensed", "Arial Narrow", sans-serif;
+  font-style: italic;
+  font-weight: 800;
+  letter-spacing: 0.025em;
+  text-transform: uppercase;
+}
+
+h1.mantine-Title-root {
+  border-left: 5px solid var(--hud-orange);
+  line-height: 1;
+  padding-left: 0.65rem;
+}
+
+.mantine-Card-root {
+  background: var(--hud-panel);
+  border-color: var(--hud-border);
+  box-shadow: var(--hud-shadow);
+  clip-path: polygon(
+    0 0,
+    calc(100% - var(--hud-cut)) 0,
+    100% var(--hud-cut),
+    100% 100%,
+    var(--hud-cut) 100%,
+    0 calc(100% - var(--hud-cut))
+  );
+  position: relative;
+}
+
+.mantine-Card-root::before {
+  background: linear-gradient(90deg, var(--hud-orange), transparent);
+  content: "";
+  height: 2px;
+  left: 0;
+  position: absolute;
+  top: 0;
+  width: 6rem;
+  z-index: 2;
+}
+
+.hud-stat {
+  background:
+    linear-gradient(135deg, rgb(250 156 30 / 9%), transparent 45%),
+    var(--hud-panel-raised);
+  min-height: 112px;
+}
+
+.hud-stat-value {
+  font-family: "Avenir Next Condensed", "Arial Narrow", monospace;
+  font-size: 1.65rem;
+  font-style: italic;
+  letter-spacing: -0.015em;
+}
+
+.mantine-Button-root,
+.mantine-ActionIcon-root,
+.mantine-Badge-root {
+  clip-path: polygon(5px 0, 100% 0, calc(100% - 5px) 100%, 0 100%);
+}
+
+.mantine-Button-root {
+  font-family: "Avenir Next Condensed", "Arial Narrow", sans-serif;
+  font-style: italic;
+  font-weight: 800;
+  letter-spacing: 0.045em;
+  text-transform: uppercase;
+}
+
+.mantine-Badge-root {
+  font-weight: 800;
+  letter-spacing: 0.035em;
+  text-transform: uppercase;
+}
+
+.mantine-Table-thead {
+  background: rgb(250 156 30 / 10%);
+  border-bottom: 2px solid var(--hud-orange);
+}
+
+.mantine-Table-th {
+  color: var(--mantine-color-dimmed);
+  font-family: "Avenir Next Condensed", "Arial Narrow", sans-serif;
+  font-size: 0.72rem;
+  font-style: italic;
+  letter-spacing: 0.075em;
+  text-transform: uppercase;
+}
+
+.mantine-Table-tr {
+  border-color: var(--hud-border-soft);
+}
+
+.mantine-Table-tbody .mantine-Table-tr:hover {
+  background: rgb(250 156 30 / 7%);
+}
+
+.mantine-Progress-root {
+  border: 1px solid var(--hud-border-soft);
+  clip-path: polygon(4px 0, 100% 0, calc(100% - 4px) 100%, 0 100%);
+}
+
+.mantine-Progress-section {
+  background: linear-gradient(90deg, #e87e0c, var(--hud-orange-bright));
+}
+
+.mantine-Alert-root {
+  background: var(--hud-panel);
+  border-color: var(--hud-border);
+  border-left-width: 4px;
+  box-shadow: 0 8px 18px rgb(0 0 0 / 8%);
+  clip-path: polygon(0 0, calc(100% - 10px) 0, 100% 10px, 100% 100%, 0 100%);
+}
+
+.mantine-Select-input {
+  background: var(--hud-panel-raised);
+  border-color: var(--hud-border);
+  clip-path: polygon(6px 0, 100% 0, calc(100% - 6px) 100%, 0 100%);
+  font-family: "Avenir Next Condensed", "Arial Narrow", sans-serif;
+  font-size: 0.75rem;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.recharts-cartesian-grid line {
+  stroke: var(--hud-border-soft);
+}
+
+.recharts-text {
+  fill: var(--mantine-color-dimmed);
+  font-family: "Avenir Next Condensed", "Arial Narrow", sans-serif;
+  font-size: 0.72rem;
+}
+
+@media (max-width: 48em) {
+  .hud-brand::after,
+  .mantine-Button-label {
+    display: none;
+  }
+
+  .mantine-Button-root {
+    padding-inline: 0.65rem;
+  }
+}

@@ -2,4 +2,8 @@
 .pytest_cache/
 __pycache__/
 *.py[cod]
+node_modules/
+*.tsbuildinfo
 dist/
+!src/overwatch/static/dist/
+!src/overwatch/static/dist/**
