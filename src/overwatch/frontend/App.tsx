@@ -42,7 +42,7 @@ import {
 } from "@tabler/icons-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
-import type { ConfigDifference, QueryStatusReport, Report, Resource } from "./types";
+import type { ConfigDifference, LogAttempt, QueryStatusReport, Report, Resource } from "./types";
 
 const ACTIVE_STATUSES = new Set([
   "PENDING",
@@ -413,6 +413,9 @@ function ResourcesTable({ resources }: { resources: Resource[] }) {
   const [descending, setDescending] = useState(true);
   const [logResource, setLogResource] = useState<Resource | null>(null);
   const [logHtml, setLogHtml] = useState("");
+  const [logAttempts, setLogAttempts] = useState<LogAttempt[]>([]);
+  const [expectedLogAttempts, setExpectedLogAttempts] = useState(0);
+  const [selectedLogAttempt, setSelectedLogAttempt] = useState<string | null>(null);
 
   const sortedResources = useMemo(() => {
     return [...resources].sort((left, right) => {
@@ -446,21 +449,54 @@ function ResourcesTable({ resources }: { resources: Resource[] }) {
 
   useEffect(() => {
     if (!logResource?.skypilot.job_id) return;
+    const controller = new AbortController();
+    setLogAttempts([]);
+    setSelectedLogAttempt(null);
+    setLogHtml("Finding CloudWatch attempts…\n");
+    fetch(`/api/logs/${logResource.skypilot.job_id}/attempts`, { signal: controller.signal })
+      .then(async (response) => {
+        if (!response.ok) throw new Error(await response.text());
+        return response.json() as Promise<{ attempts: LogAttempt[]; expected_attempts: number }>;
+      })
+      .then(({ attempts, expected_attempts }) => {
+        setLogAttempts(attempts);
+        setExpectedLogAttempts(expected_attempts);
+        setSelectedLogAttempt(attempts.at(-1)?.attempt.toString() ?? null);
+        if (!attempts.length) setLogHtml("No CloudWatch workload attempts were found.\n");
+      })
+      .catch((error: Error) => {
+        if (error.name !== "AbortError") setLogHtml(`CloudWatch attempt lookup failed: ${error.message}\n`);
+      });
+    return () => controller.abort();
+  }, [logResource]);
+
+  useEffect(() => {
+    if (!logResource?.skypilot.job_id || !selectedLogAttempt) return;
     setLogHtml("Connecting to CloudWatch…\n");
-    const events = new EventSource(`/api/logs/${logResource.skypilot.job_id}`);
+    const events = new EventSource(
+      `/api/logs/${logResource.skypilot.job_id}?attempt=${selectedLogAttempt}`,
+    );
     events.onmessage = (event) => {
-      const item = JSON.parse(event.data) as { timestamp: number; html: string };
-      const timestamp = new Date(item.timestamp).toLocaleTimeString();
+      const payload = JSON.parse(event.data) as {
+        events: Array<{ timestamp: number; html: string }>;
+      };
+      const lines = payload.events
+        .map((item) => `[${new Date(item.timestamp).toLocaleTimeString()}] ${item.html}`)
+        .join("\n");
       setLogHtml((current) =>
-        `${current.startsWith("Connecting") ? "" : current}[${timestamp}] ${item.html}\n`,
+        `${current.startsWith("Connecting") ? "" : current}${lines}\n`,
       );
     };
     events.onerror = () =>
       setLogHtml((current) =>
         current.endsWith("Reconnecting…\n") ? current : `${current}\nReconnecting…\n`,
       );
+    events.addEventListener("complete", () => {
+      events.close();
+      setLogHtml((current) => `${current}\n— End of attempt —\n`);
+    });
     return () => events.close();
-  }, [logResource]);
+  }, [logResource, selectedLogAttempt]);
 
   const onSort = (value: SortKey) => {
     if (sortKey === value) setDescending((current) => !current);
@@ -543,7 +579,23 @@ function ResourcesTable({ resources }: { resources: Resource[] }) {
         position="bottom"
         size="100%"
       >
-        <ScrollArea h="calc(100vh - 100px)" type="auto">
+        <Group mb="sm" justify="space-between">
+          <Select
+            label="CloudWatch attempt"
+            placeholder="Finding attempts…"
+            value={selectedLogAttempt}
+            onChange={setSelectedLogAttempt}
+            data={logAttempts.map((attempt) => ({
+              value: attempt.attempt.toString(),
+              label: `Attempt ${attempt.attempt}${attempt.current ? " · current" : ""} · PID ${attempt.pid}`,
+            }))}
+            w={360}
+          />
+          <Badge color={logAttempts.length === expectedLogAttempts ? "green" : "yellow"} variant="light">
+            {logAttempts.length}/{expectedLogAttempts || "?"} attempts with CloudWatch logs
+          </Badge>
+        </Group>
+        <ScrollArea h="calc(100vh - 180px)" type="auto">
           <Code block bg="dark.9" c="green.2" p="md">
             <span dangerouslySetInnerHTML={{ __html: logHtml }} />
           </Code>

@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import os
 import subprocess
 import sys
@@ -44,6 +45,8 @@ from overwatch.constants import (
 from overwatch.logs import (
     ansi_log_text_to_safe_html,
     cloudwatch_event_message,
+    cloudwatch_event_pid,
+    discover_cloudwatch_attempts,
     progress_from_job_log,
     resolve_cloudwatch_stream_name,
 )
@@ -65,6 +68,14 @@ QUERY_LABELS = {
     "wandb": "W&B training runs",
     "cloudwatch": "CloudWatch progress",
 }
+STATE_CACHE_VERSION = 1
+STATE_CACHE_PATH = (
+    Path.home() / "Library" / "Caches" / "Overwatch" / "state-v1.json"
+    if sys.platform == "darwin"
+    else Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+    / "overwatch"
+    / "state-v1.json"
+)
 
 
 def json_safe_query_output(value: Any) -> Any:
@@ -79,9 +90,50 @@ def json_safe_query_output(value: Any) -> Any:
         return json_safe_query_output(value.value)
     if isinstance(value, (datetime, date)):
         return value.isoformat()
+    if isinstance(value, float) and not math.isfinite(value):
+        return str(value)
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     return str(value)
+
+
+def persist_report_state(state: dict[str, Any]) -> None:
+    """Atomically persist the report and its raw query diagnostics."""
+    payload = {
+        "version": STATE_CACHE_VERSION,
+        "saved_at": isoformat(datetime.now(UTC)),
+        "report": state["report"],
+        "report_error": state["report_error"],
+        "refresh": state["refresh"],
+        "query_diagnostics": state["query_diagnostics"],
+        "log_attempts": state.get("log_attempts", {}),
+    }
+    STATE_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = STATE_CACHE_PATH.with_suffix(".tmp")
+    temporary_path.write_text(
+        json.dumps(json_safe_query_output(payload), separators=(",", ":"))
+    )
+    temporary_path.chmod(0o600)
+    temporary_path.replace(STATE_CACHE_PATH)
+
+
+def load_persisted_report_state() -> dict[str, Any] | None:
+    """Load a compatible cached report without making startup depend on it."""
+    try:
+        payload = json.loads(STATE_CACHE_PATH.read_text())
+    except FileNotFoundError:
+        return None
+    except (OSError, json.JSONDecodeError, TypeError) as error:
+        logger.warning("Ignoring unreadable Overwatch state cache: {}", error)
+        return None
+    if payload.get("version") != STATE_CACHE_VERSION:
+        logger.warning("Ignoring incompatible Overwatch state cache.")
+        return None
+    required_fields = {"report", "report_error", "refresh", "query_diagnostics"}
+    if not required_fields.issubset(payload):
+        logger.warning("Ignoring incomplete Overwatch state cache.")
+        return None
+    return payload
 
 
 def build_frontend_assets_if_sources_are_newer() -> None:
@@ -205,6 +257,13 @@ async def collect_report(
     ) -> None:
         if query_diagnostics is None:
             return
+        previous_diagnostic = query_diagnostics.get(key, {})
+        preserve_raw_output = raw_output is None and status in {"pending", "error"}
+        raw_output_updated_at = (
+            previous_diagnostic.get("raw_output_updated_at")
+            if preserve_raw_output
+            else isoformat(datetime.now(UTC))
+        )
         query_diagnostics[key] = {
             "key": key,
             "label": QUERY_LABELS[key],
@@ -215,7 +274,12 @@ async def collect_report(
                 round(duration_seconds, 2) if duration_seconds is not None else None
             ),
             "error": f"{type(error).__name__}: {error}" if error else None,
-            "raw_output": json_safe_query_output(raw_output),
+            "raw_output_updated_at": raw_output_updated_at,
+            "raw_output": (
+                previous_diagnostic.get("raw_output")
+                if preserve_raw_output
+                else json_safe_query_output(raw_output)
+            ),
         }
 
     async def run_timed_thread_query(
@@ -564,6 +628,7 @@ async def handle_raw_query_output(request: web.Request) -> web.Response:
             "error": diagnostic["error"],
             "updated_at": diagnostic["updated_at"],
             "duration_seconds": diagnostic["duration_seconds"],
+            "raw_output_updated_at": diagnostic["raw_output_updated_at"],
             "output": diagnostic["raw_output"],
         }
     )
@@ -596,6 +661,30 @@ async def handle_log_stream(request: web.Request) -> web.StreamResponse:
     if stream_name is None:
         raise web.HTTPNotFound(text="CloudWatch log stream was not found")
 
+    attempt_number = int(request.query.get("attempt", "0"))
+    attempt = None
+    attempt_is_live = False
+    if attempt_number:
+        cache_entry = await cloudwatch_attempts_for_record(
+            request.app, record, stream_name
+        )
+        attempt = next(
+            (
+                item
+                for item in cache_entry["attempts"]
+                if item["attempt"] == attempt_number
+            ),
+            None,
+        )
+        if attempt is None:
+            raise web.HTTPNotFound(
+                text=f"CloudWatch attempt {attempt_number} was not found"
+            )
+        attempt_is_live = (
+            attempt["scan_end_at"] is None
+            and record["status"].get("skypilot") in ACTIVE_SKY_STATUSES
+        )
+
     response = web.StreamResponse(
         headers={
             "Content-Type": "text/event-stream",
@@ -615,30 +704,130 @@ async def handle_log_stream(request: web.Request) -> web.StreamResponse:
             }
             if next_token is not None:
                 request_arguments["nextToken"] = next_token
+            elif attempt is not None:
+                request_arguments["startTime"] = attempt["scan_start_at"]
             else:
                 request_arguments["startTime"] = int(
                     (datetime.now(UTC) - timedelta(minutes=2)).timestamp() * 1000
                 )
+            if attempt is not None and attempt["scan_end_at"] is not None:
+                request_arguments["endTime"] = attempt["scan_end_at"] + 1
             events = await asyncio.to_thread(
                 cloudwatch_client.get_log_events, **request_arguments
             )
+            previous_token = next_token
             next_token = events["nextForwardToken"]
+            items = []
             for event in events["events"]:
-                payload = json.dumps(
+                if (
+                    attempt is not None
+                    and cloudwatch_event_pid(event) != attempt["pid"]
+                ):
+                    continue
+                items.append(
                     {
                         "timestamp": event["timestamp"],
                         "html": ansi_log_text_to_safe_html(
                             cloudwatch_event_message(event)
                         ),
-                    },
-                    separators=(",", ":"),
+                    }
                 )
+            if items:
+                payload = json.dumps({"events": items}, separators=(",", ":"))
                 await response.write(f"data: {payload}\n\n".encode())
+            if (
+                attempt is not None
+                and not attempt_is_live
+                and next_token == previous_token
+            ):
+                await response.write(b"event: complete\ndata: {}\n\n")
+                break
             await response.write(b": keepalive\n\n")
-            await asyncio.sleep(2)
+            if (attempt is None or attempt_is_live) and next_token == previous_token:
+                await asyncio.sleep(2)
     except (asyncio.CancelledError, ConnectionResetError):
         pass
     return response
+
+
+async def cloudwatch_attempts_for_record(
+    app: web.Application, record: dict[str, Any], stream_name: str
+) -> dict[str, Any]:
+    """Return cached attempt boundaries, refreshing after a new recovery."""
+    job_id = record["skypilot"]["job_id"]
+    expected_attempts = (record["retries"].get("total_recoveries") or 0) + 1
+    cache_key = str(job_id)
+    cached = app["state"]["log_attempts"].get(cache_key)
+    if (
+        cached is not None
+        and cached["stream_name"] == stream_name
+        and cached["expected_attempts"] == expected_attempts
+    ):
+        return cached
+
+    attempts = await asyncio.to_thread(
+        discover_cloudwatch_attempts,
+        app["cloudwatch_client"],
+        stream_name,
+        expected_attempts,
+    )
+    cached = {
+        "stream_name": stream_name,
+        "expected_attempts": expected_attempts,
+        "updated_at": isoformat(datetime.now(UTC)),
+        "attempts": attempts,
+    }
+    app["state"]["log_attempts"][cache_key] = cached
+    persist_report_state(app["state"])
+    return cached
+
+
+async def handle_log_attempts(request: web.Request) -> web.Response:
+    job_id = int(request.match_info["job_id"])
+    report = request.app["state"]["report"]
+    record = (
+        next(
+            (
+                item
+                for item in report["resources"]
+                if item["skypilot"]["job_id"] == job_id
+            ),
+            None,
+        )
+        if report
+        else None
+    )
+    if record is None or not record["skypilot"].get("cluster_name"):
+        raise web.HTTPNotFound(text="CloudWatch logs are unavailable for this job")
+    stream_name = await asyncio.to_thread(
+        resolve_cloudwatch_stream_name,
+        request.app["cloudwatch_client"],
+        record["skypilot"]["cluster_name"],
+    )
+    if stream_name is None:
+        raise web.HTTPNotFound(text="CloudWatch log stream was not found")
+    cache_entry = await cloudwatch_attempts_for_record(request.app, record, stream_name)
+    attempts = [
+        {
+            "attempt": item["attempt"],
+            "pid": item["pid"],
+            "started_at": datetime.fromtimestamp(
+                item["started_at"] / 1000, UTC
+            ).isoformat(),
+            "current": (
+                item["scan_end_at"] is None
+                and record["status"].get("skypilot") in ACTIVE_SKY_STATUSES
+            ),
+        }
+        for item in cache_entry["attempts"]
+    ]
+    return web.json_response(
+        {
+            "attempts": attempts,
+            "expected_attempts": cache_entry["expected_attempts"],
+            "updated_at": cache_entry["updated_at"],
+        }
+    )
 
 
 async def update_report_state(
@@ -670,6 +859,10 @@ async def update_report_state(
     finally:
         refresh["in_progress"] = False
         refresh["last_duration_seconds"] = round(perf_counter() - refresh_started, 2)
+        try:
+            await asyncio.to_thread(persist_report_state, state)
+        except (OSError, TypeError, ValueError) as error:
+            logger.warning("Could not persist Overwatch state cache: {}", error)
 
 
 async def refresh_report_forever(
@@ -691,32 +884,57 @@ async def run_service(args: argparse.Namespace) -> int:
     service_started = perf_counter()
     url = f"http://{args.host}:{args.port}"
     await asyncio.to_thread(build_frontend_assets_if_sources_are_newer)
+    cached_state = await asyncio.to_thread(load_persisted_report_state)
+
+    refresh_state = {
+        "in_progress": False,
+        "last_attempt_at": None,
+        "last_success_at": None,
+        "last_duration_seconds": None,
+        "last_error": None,
+    }
+    query_diagnostics = {
+        key: {
+            "key": key,
+            "label": label,
+            "status": "pending",
+            "summary": "Waiting for first refresh",
+            "updated_at": None,
+            "duration_seconds": None,
+            "error": None,
+            "raw_output_updated_at": None,
+            "raw_output": None,
+        }
+        for key, label in QUERY_LABELS.items()
+    }
+
+    # Restore only recognized fields so old or partially written state cannot break startup.
+    if cached_state is not None:
+        refresh_state.update(cached_state["refresh"])
+        refresh_state["in_progress"] = False
+        for key, default_diagnostic in query_diagnostics.items():
+            cached_diagnostic = cached_state["query_diagnostics"].get(key)
+            if isinstance(cached_diagnostic, dict):
+                default_diagnostic.update(cached_diagnostic)
+
     app = web.Application()
     app["state"] = {
         "startup_id": uuid.uuid4().hex,
-        "report": None,
-        "report_error": None,
-        "refresh": {
-            "in_progress": False,
-            "last_attempt_at": None,
-            "last_success_at": None,
-            "last_duration_seconds": None,
-            "last_error": None,
-        },
-        "query_diagnostics": {
-            key: {
-                "key": key,
-                "label": label,
-                "status": "pending",
-                "summary": "Waiting for first refresh",
-                "updated_at": None,
-                "duration_seconds": None,
-                "error": None,
-                "raw_output": None,
-            }
-            for key, label in QUERY_LABELS.items()
-        },
+        "report": cached_state["report"] if cached_state is not None else None,
+        "report_error": (
+            cached_state["report_error"] if cached_state is not None else None
+        ),
+        "refresh": refresh_state,
+        "query_diagnostics": query_diagnostics,
+        "log_attempts": (
+            cached_state.get("log_attempts", {}) if cached_state is not None else {}
+        ),
     }
+    if app["state"]["report"] is not None:
+        logger.info(
+            "Restored {} cached resources; refreshing in the background.",
+            len(app["state"]["report"]["resources"]),
+        )
     app.add_routes(
         [
             web.get("/", handle_index),
@@ -726,6 +944,7 @@ async def run_service(args: argparse.Namespace) -> int:
             web.get("/api/health", handle_health),
             web.get("/api/status", handle_query_status),
             web.get("/api/status/{query_key}/raw", handle_raw_query_output),
+            web.get("/api/logs/{job_id:\\d+}/attempts", handle_log_attempts),
             web.get("/api/logs/{job_id:\\d+}", handle_log_stream),
             web.static("/static", Path(files("overwatch").joinpath("static"))),
         ]

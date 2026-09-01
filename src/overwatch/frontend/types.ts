@@ -77,6 +77,13 @@ export interface Resource {
   };
 }
 
+export interface LogAttempt {
+  attempt: number;
+  pid: number;
+  started_at: string;
+  current: boolean;
+}
+
 export interface ConfigDifference {
   project: string;
   runs: Array<{ wandb_id: string; wandb_url: string | null; experiment_name: string }>;

@@ -3,12 +3,15 @@
 import asyncio
 from datetime import date
 from importlib.resources import files
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from overwatch import app as overwatch_app
 from overwatch.logs import (
     ansi_log_text_to_safe_html,
+    discover_cloudwatch_attempts,
     flow_progress_from_log_text,
     tail_cloudwatch_job_log,
 )
@@ -19,6 +22,27 @@ from overwatch.report import (
     build_sky_only_record,
     estimated_hourly_cost,
 )
+
+
+def test_report_state_cache_round_trips_private_raw_diagnostics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cache_path = tmp_path / "state.json"
+    monkeypatch.setattr(overwatch_app, "STATE_CACHE_PATH", cache_path)
+    state = {
+        "report": {"generated_at": "2026-09-01T00:00:00+00:00", "resources": []},
+        "report_error": None,
+        "refresh": {"last_success_at": "2026-09-01T00:00:00+00:00"},
+        "query_diagnostics": {"sky_jobs": {"raw_output": [{"job_id": 183}]}},
+    }
+
+    overwatch_app.persist_report_state(state)
+    restored_state = overwatch_app.load_persisted_report_state()
+
+    assert restored_state is not None
+    assert restored_state["report"] == state["report"]
+    assert restored_state["query_diagnostics"] == state["query_diagnostics"]
+    assert cache_path.stat().st_mode & 0o777 == 0o600
 
 
 def test_log_parsing_smooths_throughput_and_escapes_ansi_html() -> None:
@@ -78,6 +102,47 @@ def test_cloudwatch_progress_uses_one_bounded_latest_tail_request() -> None:
     assert len(requests) == 1
     assert requests[0]["startFromHead"] is False
     assert requests[0]["limit"] == 10_000
+
+
+def test_cloudwatch_attempt_discovery_finds_each_process_without_full_scan() -> None:
+    attempts = [(1_000, 11), (401_000, 22), (801_000, 33)]
+    requests = []
+
+    class CloudWatchClient:
+        def describe_log_streams(self, **_kwargs: object) -> dict[str, object]:
+            return {
+                "logStreams": [
+                    {
+                        "logStreamName": "stream",
+                        "firstEventTimestamp": 1_000,
+                        "lastEventTimestamp": 1_200_000,
+                    }
+                ]
+            }
+
+        def get_log_events(self, **kwargs: object) -> dict[str, object]:
+            requests.append(kwargs)
+            start_time = int(kwargs["startTime"])
+            pid = next(
+                pid
+                for index, (timestamp, pid) in enumerate(attempts)
+                if timestamp <= start_time
+                and (index + 1 == len(attempts) or start_time < attempts[index + 1][0])
+            )
+            return {
+                "events": [
+                    {
+                        "timestamp": start_time,
+                        "message": f'{{"pid":{pid},"log_line":"line"}}',
+                    }
+                ]
+            }
+
+    discovered = discover_cloudwatch_attempts(CloudWatchClient(), "stream", 3)
+
+    assert [attempt["pid"] for attempt in discovered] == [11, 22, 33]
+    assert [attempt["attempt"] for attempt in discovered] == [1, 2, 3]
+    assert all(request["limit"] == 100 for request in requests)
 
 
 def test_cost_scaling_and_packaged_browser_assets(
