@@ -171,7 +171,7 @@ def test_sky_inventory_is_unbounded_and_includes_standalone_clusters(
     monkeypatch.setattr(
         "overwatch.providers.sky.sky.get",
         lambda request: (
-            ([active_job, recent_finished_job, old_finished_job], {}, {})
+            ([recent_finished_job, old_finished_job, active_job], {}, {})
             if request == "queue"
             else [
                 managed_cluster,
@@ -186,9 +186,7 @@ def test_sky_inventory_is_unbounded_and_includes_standalone_clusters(
     jobs = collect_managed_jobs()
     clusters = collect_standalone_clusters()
     record = build_cluster_record(dev_cluster, "project-id")
-    sky_only_record = build_sky_only_record(
-        active_job, None, None, None, None, "project-id"
-    )
+    sky_only_record = build_sky_only_record(active_job, None, None, "project-id")
 
     assert jobs == [active_job, recent_finished_job]
     assert clusters == [dev_cluster, recent_stopped_cluster]

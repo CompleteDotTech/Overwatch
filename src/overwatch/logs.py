@@ -3,8 +3,6 @@
 import asyncio
 import html
 import json
-import sys
-from pathlib import Path
 from typing import Any
 from urllib.parse import unquote
 
@@ -16,7 +14,6 @@ from overwatch.constants import (
     ANSI_SGR_RE,
     AWS_CLUSTER_LINK_RE,
     CLOUDWATCH_LOG_GROUP,
-    ERROR_RETRY_RE,
     TOKENS_PER_SECOND_EMA_ALPHA,
     TRAIN_PROGRESS_RE,
 )
@@ -166,60 +163,11 @@ async def tail_cloudwatch_job_log(
     return "\n".join(cloudwatch_event_message(event) for event in events), None
 
 
-async def progress_and_retries_from_job_log(
+async def progress_from_job_log(
     job: Any, cloudwatch_client: Any, semaphore: asyncio.Semaphore
 ) -> tuple[dict[str, Any] | None, str | None]:
-    """Read the fast CloudWatch copy, falling back to SkyPilot for non-AWS jobs."""
+    """Read training progress from the fast CloudWatch copy."""
     log_text, error = await tail_cloudwatch_job_log(job, cloudwatch_client, semaphore)
     if not log_text:
-        log_text, error = await tail_sky_job_log(job, semaphore)
-    if log_text is None:
         return None, error
     return flow_progress_from_log_text(log_text)
-
-
-async def tail_sky_job_log(
-    job: Any, semaphore: asyncio.Semaphore, *, controller: bool = False
-) -> tuple[str | None, str | None]:
-    async with semaphore:
-        sky_executable = Path(sys.executable).with_name("sky")
-        command = [str(sky_executable), "jobs", "logs", str(job.job_id)]
-        if controller:
-            command.append("--controller")
-        command.extend(("--no-follow", "--tail", "10000" if controller else "2000"))
-        process = await asyncio.create_subprocess_exec(
-            *command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        try:
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=20)
-        except TimeoutError:
-            process.kill()
-            await process.communicate()
-            log_name = "controller log" if controller else "workload log"
-            return None, f"{log_name} timed out after 20 seconds"
-    if process.returncode != 0:
-        error = stderr.decode(errors="replace").strip()
-        return None, error or f"sky jobs logs exited {process.returncode}"
-    return stdout.decode(errors="replace"), None
-
-
-async def error_retry_count_from_controller_log(
-    job: Any, semaphore: asyncio.Semaphore
-) -> tuple[int | None, str | None]:
-    if not job.recovery_count:
-        return 0, None
-    controller_log, error = await tail_sky_job_log(job, semaphore, controller=True)
-    if error:
-        return None, error
-    retry_counts = [
-        int(value)
-        for value in ERROR_RETRY_RE.findall(ANSI_ESCAPE_RE.sub("", controller_log))
-    ]
-    if not retry_counts:
-        return (
-            None,
-            "controller log does not contain an application-error retry counter",
-        )
-    return max(retry_counts), None

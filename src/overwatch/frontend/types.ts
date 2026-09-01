@@ -79,7 +79,7 @@ export interface Resource {
 
 export interface ConfigDifference {
   project: string;
-  runs: Array<{ wandb_id: string; experiment_name: string }>;
+  runs: Array<{ wandb_id: string; wandb_url: string | null; experiment_name: string }>;
   fields: Array<{
     field: string;
     values: Array<{
@@ -89,6 +89,27 @@ export interface ConfigDifference {
       value_group: number;
     }>;
   }>;
+}
+
+export interface QueryDiagnostic {
+  key: string;
+  label: string;
+  status: "ok" | "warning" | "error" | "pending" | "skipped";
+  summary: string;
+  updated_at: string | null;
+  duration_seconds: number | null;
+  error: string | null;
+}
+
+export interface QueryStatusReport {
+  refresh: {
+    in_progress: boolean;
+    last_attempt_at: string | null;
+    last_success_at: string | null;
+    last_duration_seconds: number | null;
+    last_error: string | null;
+  };
+  queries: QueryDiagnostic[];
 }
 
 export interface Report {

@@ -14,6 +14,7 @@ import {
   Drawer,
   Group,
   Loader,
+  Modal,
   Progress,
   ScrollArea,
   Select,
@@ -29,8 +30,10 @@ import {
 } from "@mantine/core";
 import {
   IconAlertTriangle,
+  IconActivityHeartbeat,
   IconChartLine,
   IconCheck,
+  IconCode,
   IconCurrencyDollar,
   IconDatabase,
   IconFileText,
@@ -39,7 +42,7 @@ import {
 } from "@tabler/icons-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
-import type { ConfigDifference, Report, Resource } from "./types";
+import type { ConfigDifference, QueryStatusReport, Report, Resource } from "./types";
 
 const ACTIVE_STATUSES = new Set([
   "PENDING",
@@ -97,6 +100,14 @@ function statusColor(status: string | null): string {
   return "gray";
 }
 
+function queryDiagnosticColor(status: QueryStatusReport["queries"][number]["status"]): string {
+  if (status === "ok") return "green";
+  if (status === "warning") return "yellow";
+  if (status === "error") return "red";
+  if (status === "pending") return "blue";
+  return "gray";
+}
+
 function Warnings({ warnings }: { warnings: string[] }) {
   if (!warnings.length) return null;
   return (
@@ -112,8 +123,21 @@ function Warnings({ warnings }: { warnings: string[] }) {
 
 type Page = "resources" | "billing" | "cost-waste";
 
-function Navigation({ page }: { page: Page }) {
+function Navigation({
+  page,
+  queryStatus,
+  onOpenStatus,
+}: {
+  page: Page;
+  queryStatus: QueryStatusReport | null;
+  onOpenStatus: () => void;
+}) {
   const { colorScheme, setColorScheme } = useMantineColorScheme();
+  const hasQueryError = Boolean(
+    queryStatus?.refresh.last_error || queryStatus?.queries.some((query) => query.status === "error"),
+  );
+  const hasQueryWarning = Boolean(queryStatus?.queries.some((query) => query.status === "warning"));
+  const queryStatusColor = hasQueryError ? "red" : hasQueryWarning ? "yellow" : "green";
   return (
     <AppShell.Header px="md" className="hud-header">
       <Group h="100%" justify="space-between" wrap="nowrap">
@@ -124,8 +148,8 @@ function Navigation({ page }: { page: Page }) {
           <Anchor href="/" c="inherit" underline="never" className="hud-brand">
             Overwatch
           </Anchor>
-          <Badge color="green" variant="light" size="xs">
-            Live
+          <Badge color={queryStatusColor} variant="light" size="xs">
+            {hasQueryError ? "Degraded" : "Live"}
           </Badge>
         </Group>
         <Group gap="xs" wrap="nowrap">
@@ -152,6 +176,14 @@ function Navigation({ page }: { page: Page }) {
             leftSection={<IconChartLine size={16} />}
           >
             Billing
+          </Button>
+          <Button
+            variant="subtle"
+            color={queryStatusColor}
+            leftSection={<IconActivityHeartbeat size={16} />}
+            onClick={onOpenStatus}
+          >
+            Status
           </Button>
           <Select
             aria-label="Color scheme"
@@ -275,12 +307,14 @@ function resourceSortValue(resource: Resource, sortKey: SortKey): string | numbe
 
 function SortHeader({
   label,
+  secondaryLabel,
   value,
   active,
   descending,
   onSort,
 }: {
   label: string;
+  secondaryLabel?: string;
   value: SortKey;
   active: boolean;
   descending: boolean;
@@ -289,7 +323,8 @@ function SortHeader({
   return (
     <Table.Th>
       <UnstyledButton fw={700} onClick={() => onSort(value)}>
-        {label} {active ? (descending ? "↓" : "↑") : "↕"}
+        <span>{label} {active ? (descending ? "↓" : "↑") : "↕"}</span>
+        {secondaryLabel && <Text component="span" display="block" size="xs" c="dimmed" fw={400}>{secondaryLabel}</Text>}
       </UnstyledButton>
     </Table.Th>
   );
@@ -329,7 +364,7 @@ function ResourceLinks({ resource, onLogs }: { resource: Resource; onLogs?: () =
     },
   ];
   return (
-    <Group gap={4} wrap="nowrap">
+    <Group gap={4} wrap="wrap" maw={116}>
       {links.map(({ label, url, color, icon }) =>
         url ? (
           <Tooltip key={label} label={label}>
@@ -445,10 +480,12 @@ function ResourcesTable({ resources }: { resources: Resource[] }) {
                 <SortHeader label="User / project / run" value="name" active={sortKey === "name"} descending={descending} onSort={onSort} />
                 <SortHeader label="Status" value="status" active={sortKey === "status"} descending={descending} onSort={onSort} />
                 <SortHeader label="Progress" value="progress" active={sortKey === "progress"} descending={descending} onSort={onSort} />
-                <Table.Th>Retries</Table.Th>
-                <SortHeader label="Started" value="started" active={sortKey === "started"} descending={descending} onSort={onSort} />
-                <Table.Th>Elapsed</Table.Th>
-                <SortHeader label="Cost" value="cost" active={sortKey === "cost"} descending={descending} onSort={onSort} />
+                <Table.Th>
+                  Retries
+                  <Text size="xs" c="dimmed" fw={400}>total | preempts | error</Text>
+                </Table.Th>
+                <SortHeader label="Started" secondaryLabel="elapsed > time left" value="started" active={sortKey === "started"} descending={descending} onSort={onSort} />
+                <SortHeader label="Cost" secondaryLabel="spent / projected · $/hr" value="cost" active={sortKey === "cost"} descending={descending} onSort={onSort} />
                 <SortHeader label="Cloud / region" value="cloud" active={sortKey === "cloud"} descending={descending} onSort={onSort} />
                 <Table.Th>Links</Table.Th>
               </Table.Tr>
@@ -472,14 +509,20 @@ function ResourcesTable({ resources }: { resources: Resource[] }) {
                       {resource.progress.total_batches ? (
                         <Stack gap={4}>
                           <Text size="xs">{resource.progress.completed_batches?.toLocaleString()}/{resource.progress.total_batches.toLocaleString()} batches</Text>
-                          <Progress value={progress} size="md" />
+                          <Progress.Root size="lg" autoContrast>
+                            <Progress.Section value={progress}>
+                              <Progress.Label>{Math.round(progress)}%</Progress.Label>
+                            </Progress.Section>
+                          </Progress.Root>
                         </Stack>
                       ) : <Text c="dimmed">—</Text>}
                       {resource.progress.tokens_per_second != null && <Text size="xs" c="dimmed" mt={4}>{resource.progress.tokens_per_second.toLocaleString()} tok/s</Text>}
                     </Table.Td>
-                    <Table.Td>{resource.retries.preemption_or_infrastructure ?? "?"} | {resource.retries.application_error ?? "?"}</Table.Td>
-                    <Table.Td miw={150}>{formatTimestamp(resource.timing.started_at)}</Table.Td>
-                    <Table.Td>{formatDuration(resource.timing.elapsed_seconds)}</Table.Td>
+                    <Table.Td>{resource.retries.total_recoveries ?? "?"} | {resource.retries.preemption_or_infrastructure ?? "?"} | {resource.retries.application_error ?? "?"}</Table.Td>
+                    <Table.Td miw={150}>
+                      <Text size="xs" c="dimmed">{formatTimestamp(resource.timing.started_at)}</Text>
+                      <Text>{formatDuration(resource.timing.elapsed_seconds)} &gt; {formatDuration(resource.progress.estimated_remaining_seconds)}</Text>
+                    </Table.Td>
                     <Table.Td miw={150}>
                       <Text>{formatMoney(resource.cost.estimated_spend_usd)} / {formatMoney(resource.cost.estimated_total_usd)}</Text>
                       <Text size="xs" c="dimmed">{formatMoney(resource.cost.hourly_usd)}/hr</Text>
@@ -522,7 +565,13 @@ function ConfigDifferences({ projects }: { projects: ConfigDifference[] }) {
               <Table.Thead>
                 <Table.Tr>
                   <Table.Th>Field</Table.Th>
-                  {project.runs.map((run) => <Table.Th key={run.wandb_id}>{run.experiment_name}</Table.Th>)}
+                  {project.runs.map((run) => (
+                    <Table.Th key={run.wandb_id}>
+                      <Anchor href={run.wandb_url ?? undefined} target="_blank" rel="noreferrer">
+                        {run.experiment_name}
+                      </Anchor>
+                    </Table.Th>
+                  ))}
                 </Table.Tr>
               </Table.Thead>
               <Table.Tbody>
@@ -569,7 +618,7 @@ function ResourcesPage({ report }: { report: Report }) {
         <ResourcesTable resources={report.resources} />
       </Box>
       <Box id="config">
-        <Title order={2} mb="md">TrainConfig differences</Title>
+        <Title order={2} mb="md">Running Job TrainConfig Deltas</Title>
         <ConfigDifferences projects={report.config_differences} />
       </Box>
     </Stack>
@@ -772,9 +821,103 @@ function CostWastePage({ report }: { report: Report }) {
   );
 }
 
+function QueryStatusModal({
+  opened,
+  onClose,
+  queryStatus,
+}: {
+  opened: boolean;
+  onClose: () => void;
+  queryStatus: QueryStatusReport | null;
+}) {
+  const [rawQuery, setRawQuery] = useState<{ title: string; content: string } | null>(null);
+
+  const openRawQuery = async (key: string, label: string) => {
+    setRawQuery({ title: label, content: "Loading raw output…" });
+    try {
+      const response = await fetch(`/api/status/${key}/raw`, { cache: "no-store" });
+      const output: unknown = await response.json();
+      if (!response.ok) throw new Error(`Raw query request failed (${response.status})`);
+      setRawQuery({ title: label, content: JSON.stringify(output, null, 2) });
+    } catch (requestError: unknown) {
+      setRawQuery({ title: label, content: String(requestError) });
+    }
+  };
+
+  return (
+    <>
+      <Modal opened={opened} onClose={onClose} title="Overwatch query status" size="xl">
+        {!queryStatus ? (
+          <Center h={160}><Loader /></Center>
+        ) : (
+          <Stack gap="md">
+            <Group gap="lg">
+              <Text size="sm">Last attempt: {formatTimestamp(queryStatus.refresh.last_attempt_at)}</Text>
+              <Text size="sm">Last success: {formatTimestamp(queryStatus.refresh.last_success_at)}</Text>
+              <Text size="sm">
+                Duration: {queryStatus.refresh.last_duration_seconds == null ? "—" : `${queryStatus.refresh.last_duration_seconds.toFixed(1)}s`}
+              </Text>
+              {queryStatus.refresh.in_progress && <Badge color="blue">Refreshing</Badge>}
+            </Group>
+            {queryStatus.refresh.last_error && (
+              <Alert color="red" title="Last refresh failed" icon={<IconAlertTriangle size={18} />}>
+                {queryStatus.refresh.last_error}
+              </Alert>
+            )}
+            <Table.ScrollContainer minWidth={700}>
+              <Table striped highlightOnHover>
+                <Table.Thead>
+                  <Table.Tr>
+                    <Table.Th>Query</Table.Th>
+                    <Table.Th>Status</Table.Th>
+                    <Table.Th>Duration</Table.Th>
+                    <Table.Th>Summary</Table.Th>
+                    <Table.Th>Updated</Table.Th>
+                    <Table.Th>Output</Table.Th>
+                  </Table.Tr>
+                </Table.Thead>
+                <Table.Tbody>
+                  {queryStatus.queries.map((query) => (
+                    <Table.Tr key={query.key}>
+                      <Table.Td>{query.label}</Table.Td>
+                      <Table.Td><Badge color={queryDiagnosticColor(query.status)}>{query.status}</Badge></Table.Td>
+                      <Table.Td>{query.duration_seconds == null ? "—" : `${query.duration_seconds.toFixed(2)}s`}</Table.Td>
+                      <Table.Td>{query.error ?? query.summary}</Table.Td>
+                      <Table.Td>{formatTimestamp(query.updated_at)}</Table.Td>
+                      <Table.Td>
+                        <Anchor component="button" type="button" onClick={() => void openRawQuery(query.key, query.label)}>
+                          <Group gap={4} wrap="nowrap"><IconCode size={15} /> Raw</Group>
+                        </Anchor>
+                      </Table.Td>
+                    </Table.Tr>
+                  ))}
+                </Table.Tbody>
+              </Table>
+            </Table.ScrollContainer>
+          </Stack>
+        )}
+      </Modal>
+      <Drawer
+        opened={rawQuery != null}
+        onClose={() => setRawQuery(null)}
+        title={`Raw query output · ${rawQuery?.title ?? ""}`}
+        position="right"
+        size="xl"
+        zIndex={300}
+      >
+        <ScrollArea h="calc(100vh - 100px)" type="auto">
+          <Code block>{rawQuery?.content}</Code>
+        </ScrollArea>
+      </Drawer>
+    </>
+  );
+}
+
 export function App() {
   const [report, setReport] = useState<Report | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [queryStatus, setQueryStatus] = useState<QueryStatusReport | null>(null);
+  const [statusOpened, setStatusOpened] = useState(false);
   const serviceState = useRef<{
     startup_id: string;
     report_version: string | null;
@@ -817,13 +960,31 @@ export function App() {
     };
     void loadReport();
 
+    const loadQueryStatus = async () => {
+      try {
+        const response = await fetch("/api/status", { cache: "no-store" });
+        if (!response.ok) throw new Error(`Status request failed (${response.status})`);
+        const nextQueryStatus = (await response.json()) as QueryStatusReport;
+        if (!stopped) setQueryStatus(nextQueryStatus);
+      } catch {
+        // The source reloader briefly takes the local service offline.
+      }
+    };
+    void loadQueryStatus();
+
     const interval = window.setInterval(async () => {
       try {
-        const response = await fetch("/api/health", { cache: "no-store" });
-        const nextState = (await response.json()) as {
+        const [healthResponse, statusResponse] = await Promise.all([
+          fetch("/api/health", { cache: "no-store" }),
+          fetch("/api/status", { cache: "no-store" }),
+        ]);
+        const nextState = (await healthResponse.json()) as {
           startup_id: string;
           report_version: string | null;
         };
+        if (statusResponse.ok && !stopped) {
+          setQueryStatus((await statusResponse.json()) as QueryStatusReport);
+        }
         if (
           serviceState.current &&
           (nextState.startup_id !== serviceState.current.startup_id ||
@@ -844,11 +1005,18 @@ export function App() {
     };
   }, []);
 
+  const failedQueries = queryStatus?.queries.filter((query) => query.status === "error") ?? [];
+
   return (
     <AppShell header={{ height: 60 }} padding="lg">
-      <Navigation page={page} />
+      <Navigation page={page} queryStatus={queryStatus} onOpenStatus={() => setStatusOpened(true)} />
       <AppShell.Main className="hud-main">
         {error && <Alert color="red">{error}</Alert>}
+        {(queryStatus?.refresh.last_error || failedQueries.length > 0) && (
+          <Alert color="red" title="Overwatch query failure" icon={<IconAlertTriangle size={18} />} mb="md">
+            {queryStatus?.refresh.last_error ?? `${failedQueries.map((query) => query.label).join(", ")} failed.`} The last successful report remains visible; open Status for details and raw outputs.
+          </Alert>
+        )}
         {!report && (
           <Center h={300}>
             <Stack align="center" gap="sm">
@@ -861,6 +1029,7 @@ export function App() {
         {report && page === "billing" && <BillingPage report={report} />}
         {report && page === "cost-waste" && <CostWastePage report={report} />}
       </AppShell.Main>
+      <QueryStatusModal opened={statusOpened} onClose={() => setStatusOpened(false)} queryStatus={queryStatus} />
     </AppShell>
   );
 }

@@ -66,6 +66,7 @@ def config_differences(
                     "runs": [
                         {
                             "wandb_id": record["wandb_id"],
+                            "wandb_url": record["links"]["wandb"],
                             "experiment_name": (record["name"] or "").split("/", 1)[-1],
                         }
                         for record, _ in project_rows

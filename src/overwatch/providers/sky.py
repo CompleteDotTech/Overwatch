@@ -8,6 +8,7 @@ import sky.jobs
 
 from overwatch.constants import (
     ACTIVE_RESOURCE_STATUSES,
+    ACTIVE_SKY_STATUSES,
     RESOURCE_HISTORY_DAYS,
     TERMINAL_SKY_STATUSES,
 )
@@ -49,13 +50,21 @@ def collect_managed_jobs() -> list[Any]:
     )
     jobs = result[0] if isinstance(result, tuple) else result
     history_cutoff = time.time() - RESOURCE_HISTORY_DAYS * 24 * 60 * 60
-    return [
+    retained_jobs = [
         job
         for job in jobs
         if enum_value(job.status) not in TERMINAL_SKY_STATUSES
         or getattr(job, "end_at", None) is None
         or job.end_at >= history_cutoff
     ]
+    return sorted(
+        retained_jobs,
+        key=lambda job: (
+            enum_value(job.status) != "RUNNING",
+            enum_value(job.status) not in ACTIVE_SKY_STATUSES,
+            -(getattr(job, "submitted_at", None) or 0),
+        ),
+    )
 
 
 def collect_standalone_clusters() -> list[Any]:

@@ -32,7 +32,6 @@ TERMINAL_SKY_STATUSES = {
 HAIKU_SUFFIX_RE = re.compile(r"__[a-z]+_[a-z]+$")
 GPU_RESOURCE_RE = re.compile(r"\[([^]:]+):(\d+(?:\.\d+)?)\]")
 NODE_COUNT_RE = re.compile(r"^(\d+)x\[")
-ERROR_RETRY_RE = re.compile(r"max_restarts_on_errors is set to \d+\. \[(\d+)/\d+\]")
 CLOUD_CONFIG_RE = re.compile(r"(?:gcs?|r2)://\S+/train_config\.yaml$")
 AWS_CLUSTER_LINK_RE = re.compile(r"tag:ray-cluster-name=([^&]+)")
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")

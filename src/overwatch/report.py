@@ -195,8 +195,6 @@ def build_run_record(
     config: dict[str, Any],
     log_progress: dict[str, Any] | None,
     progress_error: str | None,
-    error_retries: int | None,
-    retry_error: str | None,
     zymtrace_project_id: str,
 ) -> dict[str, Any]:
     timing = calculate_progress_and_timing(run, job, log_progress, config)
@@ -204,9 +202,6 @@ def build_run_record(
     run_uri, gcp_bucket, gcp_console_url = gcp_storage_info(config_uri)
     job_name = job.job_name if job else normalized_wandb_experiment_name(run)
     recovery_count = job.recovery_count if job else None
-    preemption_retries = None
-    if recovery_count is not None and error_retries is not None:
-        preemption_retries = max(0, recovery_count - error_retries)
 
     hourly_cost, cost_basis = estimated_hourly_cost(job) if job else (None, None)
     elapsed_seconds = timing["elapsed_seconds"]
@@ -244,10 +239,9 @@ def build_run_record(
             "collection_error": progress_error,
         },
         "retries": {
-            "preemption_or_infrastructure": preemption_retries,
-            "application_error": error_retries,
+            "preemption_or_infrastructure": None,
+            "application_error": None,
             "total_recoveries": recovery_count,
-            "collection_error": retry_error,
         },
         "timing": {
             key: timing[key]
@@ -303,8 +297,6 @@ def build_sky_only_record(
     job: Any,
     log_progress: dict[str, Any] | None,
     progress_error: str | None,
-    error_retries: int | None,
-    retry_error: str | None,
     zymtrace_project_id: str,
 ) -> dict[str, Any]:
     wandb_url = next(
@@ -331,11 +323,6 @@ def build_sky_only_record(
     )
     hourly_cost, cost_basis = estimated_hourly_cost(job)
     recovery_count = job.recovery_count
-    preemption_retries = (
-        max(0, recovery_count - error_retries)
-        if recovery_count is not None and error_retries is not None
-        else None
-    )
     started_at = timestamp_from_epoch(job.start_at)
     return {
         "kind": "managed_job",
@@ -378,10 +365,9 @@ def build_sky_only_record(
             "collection_error": progress_error,
         },
         "retries": {
-            "preemption_or_infrastructure": preemption_retries,
-            "application_error": error_retries,
+            "preemption_or_infrastructure": None,
+            "application_error": None,
             "total_recoveries": recovery_count,
-            "collection_error": retry_error,
         },
         "timing": {
             "started_at": isoformat(started_at),
