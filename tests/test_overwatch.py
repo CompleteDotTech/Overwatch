@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import pytest
 from aiohttp.test_utils import make_mocked_request
 
-from overwatch import app, cloudwatch_cache, raw_cache
+from overwatch import app, cloudwatch_cache, log_api, raw_cache
 from overwatch.cached_metrics import (
     cached_billing_report,
     cached_cloudwatch_attempts,
@@ -98,13 +98,13 @@ def test_log_api_rejects_invalid_attempt_and_throttles_refreshes(
         app=application,
     )
     with pytest.raises(app.web.HTTPBadRequest) as exception_info:
-        asyncio.run(app.handle_cached_log_page(invalid_request))
+        asyncio.run(log_api.handle_cached_log_page(invalid_request))
     assert exception_info.value.text == "attempt must be an integer"
 
     async def request_two_immediate_refreshes() -> None:
-        first_task = app.ensure_cached_log_refresh_task(application, 1)
+        first_task = log_api.ensure_cached_log_refresh_task(application, 1)
         await first_task
-        second_task = app.ensure_cached_log_refresh_task(application, 1)
+        second_task = log_api.ensure_cached_log_refresh_task(application, 1)
         assert second_task is first_task
         await second_task
 
