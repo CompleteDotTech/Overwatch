@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from overwatch import collector
+from overwatch import cloudwatch_cache, raw_cache
 from overwatch.cached_metrics import (
     cached_billing_report,
     cached_cloudwatch_attempts,
@@ -122,15 +122,19 @@ def test_raw_cloudwatch_cache_only_appends_new_events(
             return responses.pop(0)
 
     # Replace the cache root and AWS client so append/cursor behavior is deterministic.
-    monkeypatch.setattr(collector, "RAW_CACHE_ROOT", tmp_path / "raw-v1")
-    monkeypatch.setattr(collector.boto3, "client", lambda *_args, **_kwargs: CloudWatchClient())
+    monkeypatch.setattr(raw_cache, "RAW_CACHE_ROOT", tmp_path / "raw-v1")
+    monkeypatch.setattr(
+        cloudwatch_cache.boto3,
+        "client",
+        lambda *_args, **_kwargs: CloudWatchClient(),
+    )
     job = {
         "job_id": 183,
         "status": "RUNNING",
         "cloud": "aws",
         "links": {"AWS Instances": "https://example.test/?tag:ray-cluster-name=cluster"},
     }
-    legacy_events_path = collector.raw_cache_path(
+    legacy_events_path = raw_cache.raw_cache_path(
         "jobs", "183", "cloudwatch", "events.jsonl"
     )
     legacy_events_path.parent.mkdir(parents=True)
@@ -138,16 +142,24 @@ def test_raw_cloudwatch_cache_only_appends_new_events(
         '{"timestamp":1000,"ingestionTime":1001,"message":"{\\"pid\\":11,\\"log\\":\\"one\\"}"}\n'
     )
 
-    collector.append_cloudwatch_events(job)
-    collector.append_cloudwatch_events(job)
+    cloudwatch_cache.append_cloudwatch_events(job)
+    cloudwatch_cache.append_cloudwatch_events(job)
 
-    events_path = collector.raw_cache_path(
+    events_path = raw_cache.raw_cache_path(
         "jobs", "183", "cloudwatch", "events.jsonl.zst"
     )
     events_index_path = events_path.with_name("events.index.json")
     human_log_path = events_path.with_name("events.log")
     assert not legacy_events_path.exists()
-    assert sum(1 for _line in collector.iter_cloudwatch_event_lines_from_file(events_path)) == 3
+    assert (
+        sum(
+            1
+            for _line in cloudwatch_cache.iter_cloudwatch_event_lines_from_file(
+                events_path
+            )
+        )
+        == 3
+    )
     assert '"format": "jsonl-zstd-frames-v1"' in events_index_path.read_text()
     assert "1970-01-01T00:00:03.000Z pid=22 | three" in human_log_path.read_text()
     assert [attempt["pid"] for attempt in cached_cloudwatch_attempts(183, 2)] == [11, 22]
@@ -174,18 +186,27 @@ def test_raw_cloudwatch_cache_only_appends_new_events(
     assert [item["timestamp"] for item in first_page["events"]] == [1_000, 2_000]
     assert first_page["has_older"] is False
     assert first_page["has_newer"] is True
-    cursor_text = collector.raw_cache_path("jobs", "183", "cloudwatch", "cursor.json").read_text()
+    cursor_text = raw_cache.raw_cache_path(
+        "jobs", "183", "cloudwatch", "cursor.json"
+    ).read_text()
     assert '\n  "next_forward_token": "second"' in cursor_text
+
+    # Discard a compressed frame whose index write was interrupted after the data append.
+    committed_size = events_path.stat().st_size
+    with events_path.open("ab") as events_file:
+        events_file.write(b"uncommitted-frame")
+    cloudwatch_cache.ensure_cloudwatch_zstd_cache(events_path.parent)
+    assert events_path.stat().st_size == committed_size
 
     # A terminal full-history pass retains the same appendable indexed Zstandard cache.
     job["status"] = "SUCCEEDED"
-    collector.append_cloudwatch_events(job, full_logs=True)
+    cloudwatch_cache.append_cloudwatch_events(job, full_logs=True)
 
     assert events_path.exists()
     assert events_index_path.exists()
     assert human_log_path.exists()
     assert [attempt["pid"] for attempt in cached_cloudwatch_attempts(183, 2)] == [11, 22]
-    assert '"events_file": "events.jsonl.zst"' in collector.raw_cache_path(
+    assert '"events_file": "events.jsonl.zst"' in raw_cache.raw_cache_path(
         "jobs", "183", "cloudwatch", "cursor.json"
     ).read_text()
 
@@ -295,9 +316,9 @@ def test_sky_inventory_is_unbounded_and_includes_standalone_clusters(
     raw_clusters = collect_standalone_clusters()
 
     # Cache readers, rather than provider adapters, own display-window filtering.
-    monkeypatch.setattr(collector, "RAW_CACHE_ROOT", tmp_path / "raw-v1")
-    collector.write_json_atomically(
-        collector.raw_cache_path("global", "sky", "jobs.json"),
+    monkeypatch.setattr(raw_cache, "RAW_CACHE_ROOT", tmp_path / "raw-v1")
+    raw_cache.write_json_atomically(
+        raw_cache.raw_cache_path("global", "sky", "jobs.json"),
         [
             {"job_id": 8, "status": "SUCCEEDED", "end_at": now - 86400},
             {"job_id": 9, "status": "FAILED", "end_at": 0},
@@ -309,8 +330,8 @@ def test_sky_inventory_is_unbounded_and_includes_standalone_clusters(
             },
         ],
     )
-    collector.write_json_atomically(
-        collector.raw_cache_path("global", "sky", "clusters.json"),
+    raw_cache.write_json_atomically(
+        raw_cache.raw_cache_path("global", "sky", "clusters.json"),
         [
             {"name": "managed", "is_managed": True, "status": "UP"},
             {"name": "dev", "is_managed": False, "status": "UP"},
@@ -369,11 +390,11 @@ def test_daily_cloud_spend_aligns_sparse_provider_days_and_totals(
     today = datetime.now(UTC).date()
     first_day = (today - timedelta(days=29)).isoformat()
     last_day = today.isoformat()
-    monkeypatch.setattr(collector, "RAW_CACHE_ROOT", tmp_path / "raw-v1")
+    monkeypatch.setattr(raw_cache, "RAW_CACHE_ROOT", tmp_path / "raw-v1")
 
     # Normalize the same raw response shape that the production collector persists.
-    collector.write_json_atomically(
-        collector.raw_cache_path("global", "billing", "aws.json"),
+    raw_cache.write_json_atomically(
+        raw_cache.raw_cache_path("global", "billing", "aws.json"),
         {
             "responses": [
                 {
@@ -411,8 +432,8 @@ def test_daily_cloud_spend_aligns_sparse_provider_days_and_totals(
             ]
         },
     )
-    collector.write_json_atomically(
-        collector.raw_cache_path("global", "billing", "gcp.json"),
+    raw_cache.write_json_atomically(
+        raw_cache.raw_cache_path("global", "billing", "gcp.json"),
         {
             "rows": [
                 {

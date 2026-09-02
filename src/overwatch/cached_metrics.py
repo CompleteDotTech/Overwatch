@@ -14,12 +14,7 @@ from typing import Any
 import pyzstd
 import yaml
 
-from overwatch.collector import (
-    RAW_CACHE_ROOT,
-    cloudwatch_events_index_is_valid,
-    raw_cache_path,
-    read_json,
-)
+from overwatch.cloudwatch_cache import cloudwatch_events_index_is_valid
 from overwatch.constants import (
     ACTIVE_RESOURCE_STATUSES,
     ACTIVE_SKY_STATUSES,
@@ -36,6 +31,7 @@ from overwatch.logs import (
     flow_progress_from_log_text,
     flow_references_from_cloudwatch_message,
 )
+from overwatch.raw_cache import RAW_CACHE_ROOT, raw_cache_path, read_json
 from overwatch.utils import enum_value
 
 

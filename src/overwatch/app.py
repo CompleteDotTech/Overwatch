@@ -173,12 +173,8 @@ async def collect_report_from_raw_cache(
         cached_wandb_runs,
         raw_cache_manifest,
     )
-    from overwatch.collector import (
-        CollectorOptions,
-        collect_raw_metrics,
-        raw_cache_path,
-        read_json,
-    )
+    from overwatch.collector import CollectorOptions, collect_raw_metrics
+    from overwatch.raw_cache import raw_cache_path, read_json
 
     options = CollectorOptions(
         limit=args.limit,
@@ -463,7 +459,7 @@ def ensure_cached_log_refresh_task(
 async def handle_cached_log_attempts(request: web.Request) -> web.Response:
     """List attempts derived from raw cache files while history fills in."""
     from overwatch.cached_metrics import cached_cloudwatch_attempts
-    from overwatch.collector import raw_cache_path, read_json
+    from overwatch.raw_cache import raw_cache_path, read_json
 
     job_id = int(request.match_info["job_id"])
     record = resource_record_for_job(request.app, job_id)
@@ -773,7 +769,7 @@ async def run_service(args: argparse.Namespace) -> int:
     app["log_attempt_tasks"] = {}
     app["log_attempt_cache"] = {}
     app["log_refresh_tasks"] = {}
-    from overwatch.collector import raw_cache_path
+    from overwatch.raw_cache import raw_cache_path
 
     # Build the first screen immediately from raw files before refreshing providers.
     if raw_cache_path("global", "sky", "jobs.json").exists():
