@@ -61,6 +61,8 @@ import {
   statusColor,
   Warnings,
 } from "./presentation";
+import { compareResources } from "./resourceSorting";
+import type { ResourceSortKey } from "./resourceSorting";
 import type {
   ConfigDifference,
   QueryStatusReport,
@@ -150,17 +152,6 @@ function Navigation({
   );
 }
 
-type SortKey = "name" | "status" | "progress" | "started" | "cost" | "cloud";
-
-function resourceSortValue(resource: Resource, sortKey: SortKey): string | number {
-  if (sortKey === "name") return `${resource.user}/${resource.project}/${resource.name}`;
-  if (sortKey === "status") return resource.status.skypilot ?? "";
-  if (sortKey === "progress") return resource.progress.progress_fraction ?? -1;
-  if (sortKey === "started") return resource.timing.started_at ?? "";
-  if (sortKey === "cost") return resource.cost.estimated_spend_usd ?? -1;
-  return `${resource.skypilot.cloud}/${resource.skypilot.region}`;
-}
-
 function SortHeader({
   label,
   secondaryLabel,
@@ -171,10 +162,10 @@ function SortHeader({
 }: {
   label: string;
   secondaryLabel?: string;
-  value: SortKey;
+  value: ResourceSortKey;
   active: boolean;
   descending: boolean;
-  onSort: (value: SortKey) => void;
+  onSort: (value: ResourceSortKey) => void;
 }) {
   return (
     <Table.Th>
@@ -268,8 +259,8 @@ function ResourceNameLink({ resource }: { resource: Resource }) {
 }
 
 function ResourcesTable({ resources }: { resources: Resource[] }) {
-  const [sortKey, setSortKey] = useState<SortKey>("started");
-  const [descending, setDescending] = useState(true);
+  const [sortKey, setSortKey] = useState<ResourceSortKey>("status");
+  const [descending, setDescending] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
 
   const sortedResources = useMemo(() => {
@@ -296,37 +287,13 @@ function ResourcesTable({ resources }: { resources: Resource[] }) {
         )
       : resources;
 
-    return [...matchingResources].sort((left, right) => {
-      const leftStatus = left.status.skypilot ?? "";
-      const rightStatus = right.status.skypilot ?? "";
-      const leftPriority =
-        (left.kind === "managed_job" && ["RUNNING", "RECOVERING"].includes(leftStatus)) ||
-        (left.kind === "cluster" && ["UP", "AUTOSTOPPING"].includes(leftStatus))
-          ? 0
-          : ACTIVE_STATUSES.has(leftStatus)
-            ? 1
-            : 2;
-      const rightPriority =
-        (right.kind === "managed_job" && ["RUNNING", "RECOVERING"].includes(rightStatus)) ||
-        (right.kind === "cluster" && ["UP", "AUTOSTOPPING"].includes(rightStatus))
-          ? 0
-          : ACTIVE_STATUSES.has(rightStatus)
-            ? 1
-            : 2;
-      if (leftPriority !== rightPriority) return leftPriority - rightPriority;
-
-      const leftValue = resourceSortValue(left, sortKey);
-      const rightValue = resourceSortValue(right, sortKey);
-      const comparison =
-        typeof leftValue === "number" && typeof rightValue === "number"
-          ? leftValue - rightValue
-          : String(leftValue).localeCompare(String(rightValue), undefined, { numeric: true });
-      return descending ? -comparison : comparison;
-    });
+    return [...matchingResources].sort((left, right) =>
+      compareResources(left, right, sortKey, descending),
+    );
   }, [descending, resources, searchQuery, sortKey]);
 
 
-  const onSort = (value: SortKey) => {
+  const onSort = (value: ResourceSortKey) => {
     if (sortKey === value) setDescending((current) => !current);
     else {
       setSortKey(value);
@@ -357,7 +324,7 @@ function ResourcesTable({ resources }: { resources: Resource[] }) {
             <Table.Thead>
               <Table.Tr>
                 <SortHeader label="User / project / run" value="name" active={sortKey === "name"} descending={descending} onSort={onSort} />
-                <SortHeader label="Status" value="status" active={sortKey === "status"} descending={descending} onSort={onSort} />
+                <SortHeader label="Status" secondaryLabel="then newest started" value="status" active={sortKey === "status"} descending={descending} onSort={onSort} />
                 <SortHeader label="Progress" value="progress" active={sortKey === "progress"} descending={descending} onSort={onSort} />
                 <Table.Th>
                   Retries
