@@ -85,6 +85,20 @@ export interface LogAttempt {
   current: boolean;
 }
 
+export interface CloudWatchLogEvent {
+  id: string;
+  timestamp: number;
+  html: string;
+}
+
+export interface CloudWatchLogPage {
+  events: CloudWatchLogEvent[];
+  has_older: boolean;
+  has_newer: boolean;
+  oldest_cursor: string | null;
+  newest_cursor: string | null;
+}
+
 export interface ConfigDifference {
   project: string;
   runs: Array<{ wandb_id: string; wandb_url: string | null; experiment_name: string }>;
