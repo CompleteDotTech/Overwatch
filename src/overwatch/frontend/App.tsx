@@ -38,6 +38,7 @@ import {
   IconCopy,
   IconCurrencyDollar,
   IconDatabase,
+  IconRefresh,
   IconSearch,
   IconServer,
 } from "@tabler/icons-react";
@@ -76,10 +77,12 @@ function Navigation({
   page,
   queryStatus,
   onOpenStatus,
+  onRefresh,
 }: {
   page: Page;
   queryStatus: QueryStatusReport | null;
   onOpenStatus: () => void;
+  onRefresh: () => void;
 }) {
   const { colorScheme, setColorScheme } = useMantineColorScheme();
   const hasQueryError = Boolean(
@@ -125,6 +128,14 @@ function Navigation({
             leftSection={<IconChartLine size={16} />}
           >
             Billing
+          </Button>
+          <Button
+            variant="subtle"
+            leftSection={<IconRefresh size={16} />}
+            loading={queryStatus?.refresh.in_progress ?? false}
+            onClick={onRefresh}
+          >
+            Refresh
           </Button>
           <Button
             variant="subtle"
@@ -921,11 +932,31 @@ export function App() {
     };
   }, []);
 
+  const refreshReport = async () => {
+    try {
+      const response = await fetch("/api/refresh", { method: "POST" });
+      if (!response.ok) throw new Error(`Refresh request failed (${response.status})`);
+      setQueryStatus((current) =>
+        current
+          ? { ...current, refresh: { ...current.refresh, in_progress: true } }
+          : current,
+      );
+      setError(null);
+    } catch (requestError: unknown) {
+      setError(String(requestError));
+    }
+  };
+
   const failedQueries = queryStatus?.queries.filter((query) => query.status === "error") ?? [];
 
   return (
     <AppShell header={{ height: 60 }} padding="lg">
-      <Navigation page={page} queryStatus={queryStatus} onOpenStatus={() => setStatusOpened(true)} />
+      <Navigation
+        page={page}
+        queryStatus={queryStatus}
+        onOpenStatus={() => setStatusOpened(true)}
+        onRefresh={() => void refreshReport()}
+      />
       <AppShell.Main className="hud-main">
         {error && <Alert color="red">{error}</Alert>}
         {(queryStatus?.refresh.last_error || failedQueries.length > 0) && (

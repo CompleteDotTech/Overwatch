@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from argparse import Namespace
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from importlib.resources import files
@@ -110,6 +111,47 @@ def test_log_api_rejects_invalid_attempt_and_throttles_refreshes(
 
     asyncio.run(request_two_immediate_refreshes())
     assert len(calls) == 1
+
+
+def test_manual_report_refresh_deduplicates_in_flight_collection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    application = app.web.Application()
+    application[app.STATE_KEY] = app.ServiceState(
+        startup_id="test",
+        report={"resources": []},
+        report_error=None,
+        refresh=app.RefreshState(),
+        query_diagnostics={},
+    )
+    application[app.REPORT_ARGUMENTS_KEY] = Namespace()
+    application[app.REPORT_REFRESH_TASK_KEY] = None
+    collection_started = asyncio.Event()
+    allow_collection_to_finish = asyncio.Event()
+    calls = 0
+
+    async def update_report_state(*_args: object, **_kwargs: object) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        collection_started.set()
+        await allow_collection_to_finish.wait()
+        return {}
+
+    # Replace collection so the test can hold one refresh open across two requests.
+    monkeypatch.setattr(app, "update_report_state", update_report_state)
+    request = make_mocked_request("POST", "/api/refresh", app=application)
+
+    async def request_two_refreshes() -> None:
+        first_response = await app.handle_report_refresh(request)
+        await collection_started.wait()
+        second_response = await app.handle_report_refresh(request)
+        assert json.loads(first_response.text)["started"] is True
+        assert json.loads(second_response.text)["started"] is False
+        allow_collection_to_finish.set()
+        await application[app.REPORT_REFRESH_TASK_KEY]
+
+    asyncio.run(request_two_refreshes())
+    assert calls == 1
 
 
 def test_wandb_matching_prefers_exact_haiku_name_then_normalizes_both_sides() -> None:

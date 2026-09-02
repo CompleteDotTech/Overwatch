@@ -50,6 +50,11 @@ from overwatch.web_state import (
     ServiceState,
 )
 
+REPORT_ARGUMENTS_KEY = web.AppKey("report_arguments", argparse.Namespace)
+REPORT_REFRESH_TASK_KEY = web.AppKey(
+    "report_refresh_task", asyncio.Task[None] | None
+)
+
 
 def build_frontend_assets_if_sources_are_newer() -> None:
     repository_root = Path(__file__).resolve().parents[2]
@@ -217,6 +222,30 @@ async def handle_raw_query_output(request: web.Request) -> web.Response:
     )
 
 
+async def handle_report_refresh(request: web.Request) -> web.Response:
+    """Schedule one report collection pass unless a refresh is already active."""
+    state = request.app[STATE_KEY]
+    task = request.app[REPORT_REFRESH_TASK_KEY]
+    started = not state.refresh.in_progress and (task is None or task.done())
+    if started:
+
+        async def refresh_in_background() -> None:
+            try:
+                await update_report_state(
+                    request.app, request.app[REPORT_ARGUMENTS_KEY], log_progress=True
+                )
+            except Exception as error:  # noqa: BLE001 - status exposes provider errors
+                logger.error("Manual report refresh failed: {}", error)
+
+        request.app[REPORT_REFRESH_TASK_KEY] = asyncio.create_task(
+            refresh_in_background()
+        )
+    return web.json_response(
+        {"started": started, "in_progress": True},
+        status=202,
+    )
+
+
 async def update_report_state(
     app: web.Application, args: argparse.Namespace, *, log_progress: bool = False
 ) -> dict[str, Any]:
@@ -288,6 +317,8 @@ async def run_service(args: argparse.Namespace) -> int:
     }
 
     app = web.Application()
+    app[REPORT_ARGUMENTS_KEY] = args
+    app[REPORT_REFRESH_TASK_KEY] = None
     app[COLLECTOR_OPTIONS_KEY] = CollectorOptions(
         limit=args.limit,
         entity=args.entity,
@@ -331,6 +362,7 @@ async def run_service(args: argparse.Namespace) -> int:
             web.get("/billing", handle_index),
             web.get("/cost-waste", handle_index),
             web.get("/api/report", handle_report_json),
+            web.post("/api/refresh", handle_report_refresh),
             web.get("/api/health", handle_health),
             web.get("/api/status", handle_query_status),
             web.get("/api/status/{query_key}/raw", handle_raw_query_output),
@@ -386,6 +418,8 @@ async def run_service(args: argparse.Namespace) -> int:
             *app[LOG_ATTEMPT_TASKS_KEY].values(),
             *app[LOG_REFRESH_TASKS_KEY].values(),
         }
+        if report_refresh_task := app[REPORT_REFRESH_TASK_KEY]:
+            service_tasks.add(report_refresh_task)
         for task in service_tasks:
             task.cancel()
         await asyncio.gather(*service_tasks, return_exceptions=True)
