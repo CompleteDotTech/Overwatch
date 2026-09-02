@@ -1,13 +1,15 @@
 """Focused regression coverage for Overwatch."""
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from importlib.resources import files
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from aiohttp.test_utils import make_mocked_request
 
-from overwatch import cloudwatch_cache, raw_cache
+from overwatch import app, cloudwatch_cache, raw_cache
 from overwatch.cached_metrics import (
     cached_billing_report,
     cached_cloudwatch_attempts,
@@ -53,6 +55,59 @@ def test_log_parsing_smooths_throughput_and_escapes_ansi_html() -> None:
     assert ansi_log_text_to_safe_html("\x1b[31m<script>bad</script>\x1b[0m") == (
         '<span style="color:#cd3131">&lt;script&gt;bad&lt;/script&gt;</span>'
     )
+
+
+def test_log_api_rejects_invalid_attempt_and_throttles_refreshes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    application = app.web.Application()
+    application[app.STATE_KEY] = app.ServiceState(
+        startup_id="test",
+        report={
+            "resources": [
+                {
+                    "skypilot": {"job_id": 1, "cloud": "aws"},
+                    "retries": {"total_recoveries": 0},
+                    "status": {"skypilot": "RUNNING"},
+                }
+            ]
+        },
+        report_error=None,
+        refresh=app.RefreshState(),
+        query_diagnostics={},
+    )
+    application[app.COLLECTOR_OPTIONS_KEY] = object()
+    application[app.LOG_ATTEMPT_TASKS_KEY] = {}
+    application[app.LOG_ATTEMPT_CACHE_KEY] = {}
+    application[app.LOG_REFRESH_TASKS_KEY] = {}
+    application[app.LOG_REFRESH_STARTED_KEY] = {}
+    calls = []
+
+    async def collect_raw_metrics(*_args: object, **_kwargs: object) -> dict[str, object]:
+        calls.append(True)
+        return {}
+
+    # Replace collection so malformed requests and refresh throttling cannot touch AWS.
+    monkeypatch.setattr("overwatch.collector.collect_raw_metrics", collect_raw_metrics)
+    invalid_request = make_mocked_request(
+        "GET",
+        "/api/logs/1/page?attempt=invalid",
+        match_info={"job_id": "1"},
+        app=application,
+    )
+    with pytest.raises(app.web.HTTPBadRequest) as exception_info:
+        asyncio.run(app.handle_cached_log_page(invalid_request))
+    assert exception_info.value.text == "attempt must be an integer"
+
+    async def request_two_immediate_refreshes() -> None:
+        first_task = app.ensure_cached_log_refresh_task(application, 1)
+        await first_task
+        second_task = app.ensure_cached_log_refresh_task(application, 1)
+        assert second_task is first_task
+        await second_task
+
+    asyncio.run(request_two_immediate_refreshes())
+    assert len(calls) == 1
 
 
 def test_wandb_matching_prefers_exact_haiku_name_then_normalizes_both_sides() -> None:

@@ -16,9 +16,11 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import subprocess
 import sys
 import uuid
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from importlib.resources import files
 from pathlib import Path
@@ -30,27 +32,45 @@ from dotenv import load_dotenv
 from loguru import logger
 from watchfiles import DefaultFilter, run_process
 
-from overwatch.constants import (
-    ACTIVE_RESOURCE_STATUSES,
-    ACTIVE_SKY_STATUSES,
-    DEFAULT_ZYMTRACE_PROJECT_ID,
-)
-from overwatch.providers.wandb_flow import match_skypilot_jobs
-from overwatch.report import (
-    build_cluster_record,
-    build_run_record,
-    build_sky_only_record,
-)
-from overwatch.utils import enum_value, isoformat
-from overwatch.view import config_differences
+from overwatch.constants import ACTIVE_SKY_STATUSES, DEFAULT_ZYMTRACE_PROJECT_ID
+from overwatch.report_service import QUERY_LABELS, collect_report_from_raw_cache
+from overwatch.utils import isoformat
 
-QUERY_LABELS = {
-    "sky_jobs": "SkyPilot managed jobs",
-    "sky_clusters": "SkyPilot clusters",
-    "billing": "Cloud billing",
-    "wandb": "W&B training runs",
-    "cloudwatch": "CloudWatch progress",
-}
+LOG_REFRESH_MIN_INTERVAL_SECONDS = 10.0
+
+
+@dataclass
+class RefreshState:
+    """Inspectable lifecycle state for periodic report refreshes."""
+
+    in_progress: bool = False
+    last_attempt_at: str | None = None
+    last_success_at: str | None = None
+    last_duration_seconds: float | None = None
+    last_error: str | None = None
+
+
+@dataclass
+class ServiceState:
+    """Mutable application state shared by the HTTP handlers."""
+
+    startup_id: str
+    report: dict[str, Any] | None
+    report_error: str | None
+    refresh: RefreshState
+    query_diagnostics: dict[str, dict[str, Any]]
+
+
+STATE_KEY = web.AppKey("state", ServiceState)
+COLLECTOR_OPTIONS_KEY = web.AppKey("collector_options", object)
+LOG_ATTEMPT_TASKS_KEY = web.AppKey(
+    "log_attempt_tasks", dict[str, asyncio.Task[dict[str, Any]]]
+)
+LOG_ATTEMPT_CACHE_KEY = web.AppKey("log_attempt_cache", dict[str, list[dict[str, Any]]])
+LOG_REFRESH_TASKS_KEY = web.AppKey(
+    "log_refresh_tasks", dict[str, asyncio.Task[dict[str, Any]]]
+)
+LOG_REFRESH_STARTED_KEY = web.AppKey("log_refresh_started", dict[str, float])
 
 
 def build_frontend_assets_if_sources_are_newer() -> None:
@@ -155,190 +175,31 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-async def collect_report_from_raw_cache(
-    args: argparse.Namespace,
-    *,
-    log_progress: bool = False,
-    query_diagnostics: dict[str, dict[str, Any]] | None = None,
-    refresh_cache: bool = True,
-) -> dict[str, Any]:
-    """Refresh the standalone collector, then build a report only from cache files."""
-    from overwatch.cached_metrics import (
-        cached_billing_report,
-        cached_cloudwatch_retry_breakdown,
-        cached_cloudwatch_telemetry,
-        cached_sky_clusters,
-        cached_sky_jobs,
-        cached_train_config,
-        cached_wandb_runs,
-        raw_cache_manifest,
-    )
-    from overwatch.collector import CollectorOptions, collect_raw_metrics
-    from overwatch.raw_cache import raw_cache_path, read_json
+def integer_query_parameter(
+    request: web.Request, name: str, *, default: int | None, minimum: int
+) -> int:
+    """Parse one bounded integer query parameter or return HTTP 400."""
+    text = request.query.get(name)
+    if text is None:
+        if default is None:
+            raise web.HTTPBadRequest(text=f"{name} is required")
+        return default
+    try:
+        value = int(text)
+    except ValueError as error:
+        raise web.HTTPBadRequest(text=f"{name} must be an integer") from error
+    if value < minimum:
+        raise web.HTTPBadRequest(text=f"{name} must be at least {minimum}")
+    return value
 
-    options = CollectorOptions(
-        limit=args.limit,
-        entity=args.entity,
-        gcp_billing_table=(
-            getattr(args, "gcp_billing_table", None)
-            or os.environ.get("GCP_BILLING_EXPORT_TABLE")
-        ),
-    )
-    if log_progress:
-        logger.info("Refreshing the versioned raw metric cache…")
-    if refresh_cache:
-        await collect_raw_metrics(options)
-    manifest = raw_cache_manifest()
 
-    # Load every presentation input from files written by the collector.
-    jobs = cached_sky_jobs()
-    clusters = cached_sky_clusters()
-    runs = cached_wandb_runs()
-    billing = cached_billing_report(manifest)
-    matched_jobs = match_skypilot_jobs(runs, jobs)
-    matched_jobs_by_id = {job.job_id: job for job in matched_jobs if job is not None}
-    jobs_for_progress = (
-        {}
-        if args.no_log_enrichment
-        else {
-            job.job_id: job
-            for job in jobs
-            if job.job_id in matched_jobs_by_id
-            or enum_value(job.status) in ACTIVE_SKY_STATUSES
-        }
-    )
-    log_results = {
-        job_id: cached_cloudwatch_telemetry(job_id) for job_id in jobs_for_progress
-    }
-    retry_breakdowns = {
-        job.job_id: cached_cloudwatch_retry_breakdown(
-            job.job_id, job.recovery_count
-        )
-        for job in jobs
-    }
+def log_cursor_query_parameter(request: web.Request, name: str) -> str | None:
+    """Validate a timestamp and event-ID log cursor or return HTTP 400."""
+    value = request.query.get(name)
+    if value is not None and re.fullmatch(r"\d+:[0-9a-f]{24}", value) is None:
+        raise web.HTTPBadRequest(text=f"{name} is not a valid log cursor")
+    return value
 
-    # Query diagnostics reference the raw files instead of duplicating SDK dumps in memory.
-    if query_diagnostics is not None:
-        source_mapping = {
-            "sky_jobs": ("sky_jobs", [raw_cache_path("global", "sky", "jobs.json")]),
-            "sky_clusters": (
-                "sky_clusters",
-                [raw_cache_path("global", "sky", "clusters.json")],
-            ),
-            "billing": (
-                "aws_billing",
-                [
-                    raw_cache_path("global", "billing", "aws.json"),
-                    raw_cache_path("global", "billing", "gcp.json"),
-                ],
-            ),
-            "wandb": ("wandb", [raw_cache_path("global", "wandb", "runs.json")]),
-            "cloudwatch": (
-                "cloudwatch",
-                [raw_cache_path("jobs", str(job_id), "cloudwatch", "cursor.json") for job_id in jobs_for_progress],
-            ),
-        }
-        for query_key, (source_key, paths) in source_mapping.items():
-            source = manifest.get("sources", {}).get(source_key, {})
-            error = source.get("error")
-            existing_paths = [str(path) for path in paths if path.exists()]
-            query_diagnostics[query_key] = {
-                "key": query_key,
-                "label": QUERY_LABELS[query_key],
-                "status": "error" if error else "ok",
-                "summary": error or f"Cached in {len(existing_paths)} raw file(s)",
-                "updated_at": manifest.get("updated_at"),
-                "duration_seconds": source.get("duration_seconds"),
-                "error": error,
-                "raw_output_updated_at": manifest.get("updated_at"),
-                "raw_output": None,
-                "raw_files": existing_paths,
-            }
-
-    # Match cached scheduler and W&B records, then derive the UI report locally.
-    matched_runs_by_job_id = {
-        job.job_id: (run, dict(run.config))
-        for run, job in zip(runs, matched_jobs)
-        if job is not None
-    }
-    records = []
-    matched_records = []
-    matched_configs = []
-    for job in jobs:
-        job_log_progress, progress_error, training_references = log_results.get(
-            job.job_id, (None, "CloudWatch cache was not requested", {})
-        )
-        if matched_run := matched_runs_by_job_id.get(job.job_id):
-            run, config = matched_run
-            record = build_run_record(
-                run,
-                job,
-                config,
-                job_log_progress,
-                progress_error,
-                args.zymtrace_project_id,
-                retry_breakdowns[job.job_id],
-            )
-            matched_records.append(record)
-            matched_configs.append(config)
-        else:
-            record = build_sky_only_record(
-                job,
-                job_log_progress,
-                progress_error,
-                args.zymtrace_project_id,
-                retry_breakdowns[job.job_id],
-                training_references,
-                cached_train_config(job.job_id),
-            )
-        job_directory = raw_cache_path("jobs", str(job.job_id))
-        expected_cache_files = ["sky.json", "wandb.json", "train_config.yaml"]
-        if str(job.cloud).casefold() == "aws" and record["skypilot"]["cluster_name"]:
-            expected_cache_files.extend(
-                (
-                    "cloudwatch/cursor.json",
-                    "cloudwatch/events.jsonl.zst",
-                    "cloudwatch/events.index.json",
-                    "cloudwatch/events.log",
-                )
-            )
-        train_config_error = read_json(
-            job_directory / "train_config.error.json", {}
-        )
-        cache_errors = {}
-        if train_config_error.get("error"):
-            cache_errors["train_config.yaml"] = train_config_error["error"]
-        record["cache"] = {
-            "missing_files": [
-                relative_path
-                for relative_path in expected_cache_files
-                if not (job_directory / relative_path).exists()
-            ],
-            "errors": cache_errors,
-        }
-        records.append(record)
-    records.extend(
-        build_cluster_record(cluster, args.zymtrace_project_id) for cluster in clusters
-    )
-    records.sort(
-        key=lambda record: (
-            record["status"]["skypilot"] in ACTIVE_RESOURCE_STATUSES,
-            record["submitted_at"] or "",
-        ),
-        reverse=True,
-    )
-    return {
-        "generated_at": manifest.get("updated_at") or isoformat(datetime.now(UTC)),
-        "wandb_entity": runs[0].entity if runs else args.entity,
-        "requested_limit": args.limit,
-        "selection": "raw file cache",
-        "log_enrichment": not args.no_log_enrichment,
-        "billing": billing,
-        "resources": records,
-        "config_differences": config_differences(matched_records, matched_configs),
-        "warnings": billing["warnings"],
-        "raw_cache_root": manifest.get("cache_root"),
-    }
 
 
 async def handle_index(request: web.Request) -> web.Response:
@@ -347,38 +208,38 @@ async def handle_index(request: web.Request) -> web.Response:
 
 
 async def handle_report_json(request: web.Request) -> web.Response:
-    state = request.app["state"]
-    if state["report"] is None:
+    state = request.app[STATE_KEY]
+    if state.report is None:
         return web.json_response(
-            {"ready": False, "error": state["report_error"]}, status=202
+            {"ready": False, "error": state.report_error}, status=202
         )
-    return web.json_response(state["report"])
+    return web.json_response(state.report)
 
 
 async def handle_health(request: web.Request) -> web.Response:
-    state = request.app["state"]
+    state = request.app[STATE_KEY]
     return web.json_response(
         {
-            "startup_id": state["startup_id"],
+            "startup_id": state.startup_id,
             "report_version": (
-                state["report"]["generated_at"] if state["report"] else None
+                state.report["generated_at"] if state.report else None
             ),
         }
     )
 
 
 async def handle_query_status(request: web.Request) -> web.Response:
-    state = request.app["state"]
+    state = request.app[STATE_KEY]
     queries = [
         {key: value for key, value in diagnostic.items() if key != "raw_output"}
-        for diagnostic in state["query_diagnostics"].values()
+        for diagnostic in state.query_diagnostics.values()
     ]
-    return web.json_response({"refresh": state["refresh"], "queries": queries})
+    return web.json_response({"refresh": asdict(state.refresh), "queries": queries})
 
 
 async def handle_raw_query_output(request: web.Request) -> web.Response:
     query_key = request.match_info["query_key"]
-    diagnostic = request.app["state"]["query_diagnostics"].get(query_key)
+    diagnostic = request.app[STATE_KEY].query_diagnostics.get(query_key)
     if diagnostic is None:
         raise web.HTTPNotFound(text=f"Unknown query: {query_key}")
     raw_output = diagnostic["raw_output"]
@@ -409,7 +270,7 @@ def resource_record_for_job(
     app: web.Application, job_id: int
 ) -> dict[str, Any] | None:
     """Find one managed-job report record without consulting a provider."""
-    report = app["state"]["report"]
+    report = app[STATE_KEY].report
     if report is None:
         return None
     return next(
@@ -429,14 +290,14 @@ def ensure_cached_log_history_task(
     from overwatch.collector import collect_raw_metrics
 
     cache_key = str(job_id)
-    task = app["log_attempt_tasks"].get(cache_key)
+    task = app[LOG_ATTEMPT_TASKS_KEY].get(cache_key)
     if task is None or task.done():
         task = asyncio.create_task(
             collect_raw_metrics(
-                app["collector_options"], job_id=job_id, full_logs=True
+                app[COLLECTOR_OPTIONS_KEY], job_id=job_id, full_logs=True
             )
         )
-        app["log_attempt_tasks"][cache_key] = task
+        app[LOG_ATTEMPT_TASKS_KEY][cache_key] = task
     return task
 
 
@@ -447,12 +308,17 @@ def ensure_cached_log_refresh_task(
     from overwatch.collector import collect_raw_metrics
 
     cache_key = str(job_id)
-    task = app["log_refresh_tasks"].get(cache_key)
-    if task is None or task.done():
+    task = app[LOG_REFRESH_TASKS_KEY].get(cache_key)
+    last_started = app[LOG_REFRESH_STARTED_KEY].get(cache_key, 0.0)
+    if task is None or (
+        task.done()
+        and perf_counter() - last_started >= LOG_REFRESH_MIN_INTERVAL_SECONDS
+    ):
         task = asyncio.create_task(
-            collect_raw_metrics(app["collector_options"], job_id=job_id)
+            collect_raw_metrics(app[COLLECTOR_OPTIONS_KEY], job_id=job_id)
         )
-        app["log_refresh_tasks"][cache_key] = task
+        app[LOG_REFRESH_TASKS_KEY][cache_key] = task
+        app[LOG_REFRESH_STARTED_KEY][cache_key] = perf_counter()
     return task
 
 
@@ -471,12 +337,12 @@ async def handle_cached_log_attempts(request: web.Request) -> web.Response:
     cursor = read_json(
         raw_cache_path("jobs", str(job_id), "cloudwatch", "cursor.json"), {}
     )
-    task = request.app["log_attempt_tasks"].get(str(job_id))
+    task = request.app[LOG_ATTEMPT_TASKS_KEY].get(str(job_id))
     if not cursor.get("complete_from_head"):
         task = ensure_cached_log_history_task(request.app, job_id)
 
     # Reuse attempt metadata while a large raw history file is actively growing.
-    attempt_cache = request.app["log_attempt_cache"]
+    attempt_cache = request.app[LOG_ATTEMPT_CACHE_KEY]
     if cursor.get("backfill_in_progress") and str(job_id) in attempt_cache:
         attempts = attempt_cache[str(job_id)]
     else:
@@ -529,17 +395,19 @@ async def handle_cached_log_stream(request: web.Request) -> web.StreamResponse:
         raise web.HTTPNotFound(text="Cached logs are unavailable for this job")
     if str(record["skypilot"].get("cloud") or "").casefold() != "aws":
         raise web.HTTPNotFound(text="CloudWatch is unavailable for this job")
-    attempt_number = int(request.query.get("attempt", "0"))
+    attempt_number = integer_query_parameter(
+        request, "attempt", default=0, minimum=0
+    )
     if attempt_number:
         refresh_task = ensure_cached_log_history_task(request.app, job_id)
     else:
         refresh_task = ensure_cached_log_refresh_task(request.app, job_id)
 
     expected_attempts = (record["retries"].get("total_recoveries") or 0) + 1
-    attempts = request.app["log_attempt_cache"].get(str(job_id))
+    attempts = request.app[LOG_ATTEMPT_CACHE_KEY].get(str(job_id))
     if attempts is None:
         attempts = cached_cloudwatch_attempts(job_id, expected_attempts)
-        request.app["log_attempt_cache"][str(job_id)] = attempts
+        request.app[LOG_ATTEMPT_CACHE_KEY][str(job_id)] = attempts
     selected_attempt = next(
         (
             attempt
@@ -644,14 +512,22 @@ async def handle_cached_log_page(request: web.Request) -> web.Response:
         raise web.HTTPNotFound(text="Cached logs are unavailable for this job")
     if str(record["skypilot"].get("cloud") or "").casefold() != "aws":
         raise web.HTTPNotFound(text="CloudWatch is unavailable for this job")
+    attempt_number = integer_query_parameter(
+        request, "attempt", default=None, minimum=1
+    )
+    before = log_cursor_query_parameter(request, "before")
+    after = log_cursor_query_parameter(request, "after")
+    if before is not None and after is not None:
+        raise web.HTTPBadRequest(text="before and after cannot be combined")
+    edge = request.query.get("edge")
+    if edge not in {None, "start"}:
+        raise web.HTTPBadRequest(text="edge must be start")
     ensure_cached_log_history_task(request.app, job_id)
-
-    attempt_number = int(request.query.get("attempt", "0"))
     expected_attempts = (record["retries"].get("total_recoveries") or 0) + 1
-    attempts = request.app["log_attempt_cache"].get(str(job_id))
+    attempts = request.app[LOG_ATTEMPT_CACHE_KEY].get(str(job_id))
     if attempts is None:
         attempts = cached_cloudwatch_attempts(job_id, expected_attempts)
-        request.app["log_attempt_cache"][str(job_id)] = attempts
+        request.app[LOG_ATTEMPT_CACHE_KEY][str(job_id)] = attempts
     selected_attempt = next(
         (
             attempt
@@ -667,9 +543,9 @@ async def handle_cached_log_page(request: web.Request) -> web.Response:
             job_id,
             started_after=selected_attempt["scan_start_at"],
             ended_before=selected_attempt["scan_end_at"],
-            before=request.query.get("before"),
-            after=request.query.get("after"),
-            from_start=request.query.get("edge") == "start",
+            before=before,
+            after=after,
+            from_start=edge == "start",
         )
     )
 
@@ -678,31 +554,31 @@ async def update_report_state(
     app: web.Application, args: argparse.Namespace, *, log_progress: bool = False
 ) -> dict[str, Any]:
     """Run one refresh while preserving inspectable success and failure state."""
-    state = app["state"]
-    refresh = state["refresh"]
+    state = app[STATE_KEY]
+    refresh = state.refresh
     refresh_started = perf_counter()
-    refresh["in_progress"] = True
-    refresh["last_attempt_at"] = isoformat(datetime.now(UTC))
+    refresh.in_progress = True
+    refresh.last_attempt_at = isoformat(datetime.now(UTC))
     try:
         report = await collect_report_from_raw_cache(
             args,
             log_progress=log_progress,
-            query_diagnostics=state["query_diagnostics"],
+            query_diagnostics=state.query_diagnostics,
         )
     except Exception as error:
         error_message = f"{type(error).__name__}: {error}"
-        state["report_error"] = error_message
-        refresh["last_error"] = error_message
+        state.report_error = error_message
+        refresh.last_error = error_message
         raise
     else:
-        state["report"] = report
-        state["report_error"] = None
-        refresh["last_success_at"] = report["generated_at"]
-        refresh["last_error"] = None
+        state.report = report
+        state.report_error = None
+        refresh.last_success_at = report["generated_at"]
+        refresh.last_error = None
         return report
     finally:
-        refresh["in_progress"] = False
-        refresh["last_duration_seconds"] = round(perf_counter() - refresh_started, 2)
+        refresh.in_progress = False
+        refresh.last_duration_seconds = round(perf_counter() - refresh_started, 2)
 
 
 async def refresh_report_forever(
@@ -728,13 +604,7 @@ async def run_service(args: argparse.Namespace) -> int:
     if uv_env_file := os.environ.get("UV_ENV_FILE"):
         load_dotenv(uv_env_file)
     await asyncio.to_thread(build_frontend_assets_if_sources_are_newer)
-    refresh_state = {
-        "in_progress": False,
-        "last_attempt_at": None,
-        "last_success_at": None,
-        "last_duration_seconds": None,
-        "last_error": None,
-    }
+    refresh_state = RefreshState()
     query_diagnostics = {
         key: {
             "key": key,
@@ -751,7 +621,7 @@ async def run_service(args: argparse.Namespace) -> int:
     }
 
     app = web.Application()
-    app["collector_options"] = CollectorOptions(
+    app[COLLECTOR_OPTIONS_KEY] = CollectorOptions(
         limit=args.limit,
         entity=args.entity,
         gcp_billing_table=(
@@ -759,32 +629,33 @@ async def run_service(args: argparse.Namespace) -> int:
             or os.environ.get("GCP_BILLING_EXPORT_TABLE")
         ),
     )
-    app["state"] = {
-        "startup_id": uuid.uuid4().hex,
-        "report": None,
-        "report_error": None,
-        "refresh": refresh_state,
-        "query_diagnostics": query_diagnostics,
-    }
-    app["log_attempt_tasks"] = {}
-    app["log_attempt_cache"] = {}
-    app["log_refresh_tasks"] = {}
+    app[STATE_KEY] = ServiceState(
+        startup_id=uuid.uuid4().hex,
+        report=None,
+        report_error=None,
+        refresh=refresh_state,
+        query_diagnostics=query_diagnostics,
+    )
+    app[LOG_ATTEMPT_TASKS_KEY] = {}
+    app[LOG_ATTEMPT_CACHE_KEY] = {}
+    app[LOG_REFRESH_TASKS_KEY] = {}
+    app[LOG_REFRESH_STARTED_KEY] = {}
     from overwatch.raw_cache import raw_cache_path
 
     # Build the first screen immediately from raw files before refreshing providers.
     if raw_cache_path("global", "sky", "jobs.json").exists():
         try:
-            app["state"]["report"] = await collect_report_from_raw_cache(
+            app[STATE_KEY].report = await collect_report_from_raw_cache(
                 args,
                 query_diagnostics=query_diagnostics,
                 refresh_cache=False,
             )
         except (OSError, TypeError, ValueError) as error:
             logger.warning("Could not render the existing raw metric cache: {}", error)
-    if app["state"]["report"] is not None:
+    if app[STATE_KEY].report is not None:
         logger.info(
             "Restored {} cached resources; refreshing in the background.",
-            len(app["state"]["report"]["resources"]),
+            len(app[STATE_KEY].report["resources"]),
         )
     app.add_routes(
         [
@@ -827,7 +698,7 @@ async def run_service(args: argparse.Namespace) -> int:
         except (OSError, subprocess.CalledProcessError) as error:
             logger.warning("Could not open Chrome ({}); open {} manually.", error, url)
 
-    background_tasks = []
+    background_tasks: list[asyncio.Task[Any]] = []
     try:
         try:
             report = await update_report_state(app, args, log_progress=True)
@@ -843,9 +714,14 @@ async def run_service(args: argparse.Namespace) -> int:
         background_tasks.append(asyncio.create_task(refresh_report_forever(app, args)))
         await asyncio.Event().wait()
     finally:
-        for task in background_tasks:
+        service_tasks = {
+            *background_tasks,
+            *app[LOG_ATTEMPT_TASKS_KEY].values(),
+            *app[LOG_REFRESH_TASKS_KEY].values(),
+        }
+        for task in service_tasks:
             task.cancel()
-        await asyncio.gather(*background_tasks, return_exceptions=True)
+        await asyncio.gather(*service_tasks, return_exceptions=True)
         await runner.cleanup()
     return 0
 

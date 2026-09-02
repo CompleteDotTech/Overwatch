@@ -13,10 +13,8 @@ import argparse
 import asyncio
 import json
 import os
-import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path
 from time import perf_counter
 from types import SimpleNamespace
 from typing import Any
@@ -41,6 +39,7 @@ from overwatch.providers.billing import (
 from overwatch.providers.sky import collect_managed_jobs, collect_standalone_clusters
 from overwatch.providers.wandb_flow import collect_recent_flow_runs, match_skypilot_jobs
 from overwatch.raw_cache import (
+    RAW_CACHE_ROOT,
     json_safe,
     raw_cache_path,
     read_json,
@@ -49,13 +48,6 @@ from overwatch.raw_cache import (
 from overwatch.utils import enum_value, isoformat
 
 RAW_CACHE_SPEC_VERSION = 1
-HUMAN_LOG_FORMAT_VERSION = 1
-RAW_CACHE_ROOT = Path.home() / ".cache" / "overwatch" / "raw-v1"
-CLOUDWATCH_EVENTS_FORMAT = "jsonl-zstd-frames-v1"
-CLOUDWATCH_EVENTS_BLOCK_LINES = 1_000
-CLOUDWATCH_EVENTS_BLOCK_BYTES = 1024 * 1024
-_job_log_locks: dict[int, threading.Lock] = {}
-_job_log_locks_guard = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -351,14 +343,25 @@ async def collect_raw_metrics(
             ).exists()
         ]
         cloudwatch_started = perf_counter()
+        cloudwatch_semaphore = asyncio.Semaphore(8)
+
+        async def run_bounded_cloudwatch_operation(
+            function: Any, *arguments: Any
+        ) -> Any:
+            async with cloudwatch_semaphore:
+                return await asyncio.to_thread(function, *arguments)
+
+        # Bound SDK threads when a large shared inventory has many active jobs.
         cloudwatch_results = await asyncio.gather(
             *(
-                asyncio.to_thread(append_cloudwatch_events, job)
+                run_bounded_cloudwatch_operation(append_cloudwatch_events, job)
                 for job in active_jobs
                 if str(job.get("cloud", "")).casefold() == "aws"
             ),
             *(
-                asyncio.to_thread(ensure_cloudwatch_zstd_cache, job_directory)
+                run_bounded_cloudwatch_operation(
+                    ensure_cloudwatch_zstd_cache, job_directory
+                )
                 for job_directory in inactive_aws_job_directories
             ),
             return_exceptions=True,
