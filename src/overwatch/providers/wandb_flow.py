@@ -76,11 +76,9 @@ async def collect_recent_flow_runs(
     )
     recent_candidates: list[Any] = []
     for runs in recent_by_project:
-        # Flow names are `<stage>/<experiment>`. Avoid W&B's metadata property here: on a
-        # missing metadata file it silently waits five seconds for every bulk-listed run.
-        recent_candidates.extend(run for run in runs if "/" in (run.name or ""))
+        recent_candidates.extend(runs)
     running_candidates = [
-        run for runs in running_by_project for run in runs if "/" in (run.name or "")
+        run for runs in running_by_project for run in runs
     ]
     recent_candidates.sort(key=lambda run: run.created_at or "", reverse=True)
     candidates_by_path = {

@@ -165,9 +165,11 @@ async def collect_report_from_raw_cache(
     """Refresh the standalone collector, then build a report only from cache files."""
     from overwatch.cached_metrics import (
         cached_billing_report,
-        cached_cloudwatch_progress,
+        cached_cloudwatch_retry_breakdown,
+        cached_cloudwatch_telemetry,
         cached_sky_clusters,
         cached_sky_jobs,
+        cached_train_config,
         cached_wandb_runs,
         raw_cache_manifest,
     )
@@ -175,6 +177,7 @@ async def collect_report_from_raw_cache(
         CollectorOptions,
         collect_raw_metrics,
         raw_cache_path,
+        read_json,
     )
 
     options = CollectorOptions(
@@ -209,7 +212,13 @@ async def collect_report_from_raw_cache(
         }
     )
     log_results = {
-        job_id: cached_cloudwatch_progress(job_id) for job_id in jobs_for_progress
+        job_id: cached_cloudwatch_telemetry(job_id) for job_id in jobs_for_progress
+    }
+    retry_breakdowns = {
+        job.job_id: cached_cloudwatch_retry_breakdown(
+            job.job_id, job.recovery_count
+        )
+        for job in jobs
     }
 
     # Query diagnostics reference the raw files instead of duplicating SDK dumps in memory.
@@ -260,8 +269,8 @@ async def collect_report_from_raw_cache(
     matched_records = []
     matched_configs = []
     for job in jobs:
-        job_log_progress, progress_error = log_results.get(
-            job.job_id, (None, "CloudWatch cache was not requested")
+        job_log_progress, progress_error, training_references = log_results.get(
+            job.job_id, (None, "CloudWatch cache was not requested", {})
         )
         if matched_run := matched_runs_by_job_id.get(job.job_id):
             run, config = matched_run
@@ -272,6 +281,7 @@ async def collect_report_from_raw_cache(
                 job_log_progress,
                 progress_error,
                 args.zymtrace_project_id,
+                retry_breakdowns[job.job_id],
             )
             matched_records.append(record)
             matched_configs.append(config)
@@ -281,7 +291,35 @@ async def collect_report_from_raw_cache(
                 job_log_progress,
                 progress_error,
                 args.zymtrace_project_id,
+                retry_breakdowns[job.job_id],
+                training_references,
+                cached_train_config(job.job_id),
             )
+        job_directory = raw_cache_path("jobs", str(job.job_id))
+        expected_cache_files = ["sky.json", "wandb.json", "train_config.yaml"]
+        if str(job.cloud).casefold() == "aws" and record["skypilot"]["cluster_name"]:
+            expected_cache_files.extend(
+                (
+                    "cloudwatch/cursor.json",
+                    "cloudwatch/events.jsonl.zst",
+                    "cloudwatch/events.index.json",
+                    "cloudwatch/events.log",
+                )
+            )
+        train_config_error = read_json(
+            job_directory / "train_config.error.json", {}
+        )
+        cache_errors = {}
+        if train_config_error.get("error"):
+            cache_errors["train_config.yaml"] = train_config_error["error"]
+        record["cache"] = {
+            "missing_files": [
+                relative_path
+                for relative_path in expected_cache_files
+                if not (job_directory / relative_path).exists()
+            ],
+            "errors": cache_errors,
+        }
         records.append(record)
     records.extend(
         build_cluster_record(cluster, args.zymtrace_project_id) for cluster in clusters

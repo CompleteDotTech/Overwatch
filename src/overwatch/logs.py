@@ -24,6 +24,20 @@ from overwatch.constants import (
 from overwatch.utils import seconds_from_duration
 
 CLOUDWATCH_PID_RE = re.compile(r"\bpid=(?P<pid>\d+)\b")
+CLOUDWATCH_NONZERO_EXIT_RE = re.compile(
+    r"\b(?:exitcode|returncode)\s*(?::|=)\s*(?!0\b)-?\d+\b"
+)
+CLOUDWATCH_CONTAINER_EXIT_RE = re.compile(r"\bcontainer\b.*\bexited \((?!0\))\d+\)")
+CLOUDWATCH_TRAIN_CONFIG_RE = re.compile(
+    r"(?P<uri>(?:gs|r2|s3)://\S+/train_config\.yaml)"
+)
+CLOUDWATCH_R2_LOCAL_PATH_RE = re.compile(
+    r"/typesafe/r2/(?P<account>[^/]+)/(?P<bucket>[^/]+)/(?P<key>\S+/train_config\.yaml)"
+)
+CLOUDWATCH_RUN_DIR_RE = re.compile(r"\brun_dir:\s*(?P<uri>(?:gs|r2|s3)://\S+)")
+CLOUDWATCH_WANDB_URL_RE = re.compile(
+    r"https://wandb\.ai/[^/\s]+/[^/\s]+/runs/[A-Za-z0-9_-]+"
+)
 
 
 def aws_cluster_name_from_job(job: Any) -> str | None:
@@ -67,6 +81,39 @@ def cloudwatch_event_id(event: dict[str, Any]) -> str:
         f"{event['timestamp']}:{event.get('ingestionTime', '')}:{event['message']}"
     )
     return hashlib.blake2s(identity.encode(), digest_size=12).hexdigest()
+
+
+def cloudwatch_message_has_application_failure(message: str) -> bool:
+    """Identify explicit terminal application failures in a cached log line."""
+    normalized_message = ANSI_ESCAPE_RE.sub("", message).casefold()
+    return (
+        "root cause (first observed failure):" in normalized_message
+        or "childfailederror" in normalized_message
+        or "setup failed. failed workers" in normalized_message
+        or CLOUDWATCH_NONZERO_EXIT_RE.search(normalized_message) is not None
+        or CLOUDWATCH_CONTAINER_EXIT_RE.search(normalized_message) is not None
+    )
+
+
+def flow_references_from_cloudwatch_message(message: str) -> dict[str, str]:
+    """Extract durable training references present in one raw log message."""
+    normalized_message = ANSI_ESCAPE_RE.sub("", message)
+    references = {}
+    if match := CLOUDWATCH_TRAIN_CONFIG_RE.search(normalized_message):
+        config_uri = match.group("uri")
+        if config_uri.startswith("s3://") and (
+            r2_path_match := CLOUDWATCH_R2_LOCAL_PATH_RE.search(normalized_message)
+        ):
+            config_uri = (
+                f'r2://{r2_path_match.group("account")}@'
+                f'{r2_path_match.group("bucket")}/{r2_path_match.group("key")}'
+            )
+        references["config_uri"] = config_uri
+    if match := CLOUDWATCH_RUN_DIR_RE.search(normalized_message):
+        references["run_uri"] = match.group("uri")
+    if match := CLOUDWATCH_WANDB_URL_RE.search(normalized_message):
+        references["wandb_url"] = match.group(0)
+    return references
 
 
 def ansi_log_text_to_safe_html(log_text: str) -> str:

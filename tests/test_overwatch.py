@@ -12,11 +12,13 @@ from overwatch import collector
 from overwatch.cached_metrics import (
     cached_cloudwatch_attempts,
     cached_cloudwatch_log_page,
+    cached_cloudwatch_retry_breakdown,
 )
 from overwatch.logs import (
     ansi_log_text_to_safe_html,
     discover_cloudwatch_attempts,
     flow_progress_from_log_text,
+    flow_references_from_cloudwatch_message,
     tail_cloudwatch_job_log,
 )
 from overwatch.providers import billing
@@ -38,6 +40,13 @@ def test_log_parsing_smooths_throughput_and_escapes_ansi_html() -> None:
     progress, error = flow_progress_from_log_text(log_text)
 
     assert error is None
+    references = flow_references_from_cloudwatch_message(
+        "SDK download: s3://training-checkpoints/run/train_config.yaml -> "
+        "/root/typesafe/r2/account/training-checkpoints/run/train_config.yaml"
+    )
+    assert references["config_uri"] == (
+        "r2://account@training-checkpoints/run/train_config.yaml"
+    )
     assert progress is not None
     assert progress["completed_batches"] == 2
     assert progress["tokens_per_second"] == 120
@@ -172,7 +181,7 @@ def test_raw_cloudwatch_cache_only_appends_new_events(
         {
             "events": [
                 {"timestamp": 1_000, "ingestionTime": 1_001, "message": '{"pid":11,"log":"one"}'},
-                {"timestamp": 2_000, "ingestionTime": 2_001, "message": '{"pid":11,"log":"two"}'},
+                {"timestamp": 2_000, "ingestionTime": 2_001, "message": '{"pid":11,"log":"Root Cause (first observed failure):"}'},
             ],
             "nextForwardToken": "first",
         },
@@ -187,7 +196,7 @@ def test_raw_cloudwatch_cache_only_appends_new_events(
         {
             "events": [
                 {"timestamp": 1_000, "ingestionTime": 1_001, "message": '{"pid":11,"log":"one"}'},
-                {"timestamp": 2_000, "ingestionTime": 2_001, "message": '{"pid":11,"log":"two"}'},
+                {"timestamp": 2_000, "ingestionTime": 2_001, "message": '{"pid":11,"log":"Root Cause (first observed failure):"}'},
                 {"timestamp": 3_000, "ingestionTime": 3_001, "message": '{"pid":22,"log":"three"}'},
             ],
             "nextForwardToken": "complete",
@@ -236,6 +245,11 @@ def test_raw_cloudwatch_cache_only_appends_new_events(
     assert '"format": "jsonl-zstd-frames-v1"' in events_index_path.read_text()
     assert "1970-01-01T00:00:03.000Z pid=22 | three" in human_log_path.read_text()
     assert [attempt["pid"] for attempt in cached_cloudwatch_attempts(183, 2)] == [11, 22]
+    assert cached_cloudwatch_retry_breakdown(183, 1) == {
+        "preemption_or_infrastructure": 0,
+        "application_error": 1,
+        "total_recoveries": 1,
+    }
     newest_page = cached_cloudwatch_log_page(183, limit=2)
     assert [item["timestamp"] for item in newest_page["events"]] == [2_000, 3_000]
     assert newest_page["has_older"] is True

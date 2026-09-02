@@ -69,7 +69,8 @@ export interface Resource {
     cloud: string | null;
     region: string | null;
   };
-  storage: { run_uri: string | null };
+  storage: { config_uri: string | null; run_uri: string | null };
+  cache?: { missing_files: string[]; errors: Record<string, string> };
   links: {
     wandb: string | null;
     skypilot: string | null;

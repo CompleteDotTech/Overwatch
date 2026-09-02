@@ -49,7 +49,7 @@ import {
   IconServer,
   IconTerminal2,
 } from "@tabler/icons-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 
 import type { ConfigDifference, LogAttempt, QueryStatusReport, Report, Resource } from "./types";
@@ -648,7 +648,17 @@ function CloudWatchLogsView({ resource }: { resource: Resource }) {
   const [firstLogItemIndex, setFirstLogItemIndex] = useState(INITIAL_LOG_ITEM_INDEX);
   const logPagingRef = useRef(false);
   const logViewerRef = useRef<VirtuosoHandle>(null);
+  const pendingLogStartJumpRef = useRef(false);
   const pendingLogEndJumpRef = useRef(false);
+
+  useEffect(() => {
+    if (!pendingLogStartJumpRef.current || logEvents.length === 0) return;
+    pendingLogStartJumpRef.current = false;
+    logViewerRef.current?.scrollToIndex({
+      index: firstLogItemIndex,
+      align: "start",
+    });
+  }, [firstLogItemIndex, logEvents]);
 
   useEffect(() => {
     if (
@@ -857,12 +867,7 @@ function CloudWatchLogsView({ resource }: { resource: Resource }) {
       setLogHasNewer(page.has_newer);
       setFirstLogItemIndex(INITIAL_LOG_ITEM_INDEX);
       setLogStatus(page.events.length ? "" : "— Start of attempt —");
-      window.requestAnimationFrame(() =>
-        logViewerRef.current?.scrollToIndex({
-          index: INITIAL_LOG_ITEM_INDEX,
-          align: "start",
-        }),
-      );
+      pendingLogStartJumpRef.current = page.events.length > 0;
     } catch (error) {
       setLogStatus(error instanceof Error ? error.message : String(error));
     } finally {
@@ -1119,50 +1124,71 @@ function RunPage({ report, jobId }: { report: Report; jobId: number }) {
         </Group>
       </Box>
 
-      <Card withBorder padding={0}>
-        <Table verticalSpacing="sm">
-          <Table.Tbody>
-            {[
-              {
-                label: "Raw cache directory",
-                value: `${report.raw_cache_root ?? "~/.cache/overwatch/raw-v1"}/jobs/${jobId}`,
-              },
-              ...(resource.storage.run_uri
-                ? [{ label: "TrainConfig run_dir", value: resource.storage.run_uri }]
-                : []),
-            ].map(({ label, value }) => (
-              <Table.Tr key={label}>
-                <Table.Td w={180} c="dimmed" fz="sm">{label}</Table.Td>
-                <Table.Td>
-                  <Code style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>
-                    {value}
-                  </Code>
-                </Table.Td>
-                <Table.Td w={48}>
-                  <CopyButton value={value}>
-                    {({ copied, copy }) => (
-                      <Tooltip label={copied ? "Copied" : `Copy ${label}`}>
-                        <ActionIcon
-                          aria-label={`Copy ${label}`}
-                          color={copied ? "green" : "gray"}
-                          variant="subtle"
-                          onClick={copy}
-                        >
-                          {copied ? <IconCheck size={16} /> : <IconCopy size={16} />}
-                        </ActionIcon>
-                      </Tooltip>
-                    )}
-                  </CopyButton>
-                </Table.Td>
-              </Table.Tr>
-            ))}
-          </Table.Tbody>
-        </Table>
-      </Card>
+      {(resource.cache?.missing_files.length ?? 0) > 0 && (
+        <Alert color="yellow" icon={<IconAlertTriangle size={18} />} title="Raw cache is incomplete">
+          Missing cached {resource.cache!.missing_files.length === 1 ? "file" : "files"}: {resource.cache!.missing_files.map((path, index) => (
+            <Fragment key={path}>
+              {index > 0 && ", "}<Code>{path}</Code>
+              {resource.cache!.errors[path] && ` (${resource.cache!.errors[path]})`}
+            </Fragment>
+          ))}. W&B and TrainConfig files may remain unavailable until the workload initializes them.
+        </Alert>
+      )}
 
       <Box>
         <Title order={2} mb="md">Run telemetry</Title>
         <ResourcesTable resources={[resource]} />
+      </Box>
+
+      <Box>
+        <Title order={2} mb="md">Extra Info</Title>
+        <Card withBorder padding={0}>
+          <Table verticalSpacing="sm" withColumnBorders>
+            <Table.Thead>
+              <Table.Tr>
+                <Table.Th>Raw cache directory</Table.Th>
+                <Table.Th>TrainConfig run_dir</Table.Th>
+              </Table.Tr>
+            </Table.Thead>
+            <Table.Tbody>
+              <Table.Tr>
+                {[
+                  {
+                    label: "Raw cache directory",
+                    value: `${report.raw_cache_root ?? "~/.cache/overwatch/raw-v1"}/jobs/${jobId}`,
+                  },
+                  {
+                    label: "TrainConfig run_dir",
+                    value: resource.storage.run_uri,
+                  },
+                ].map(({ label, value }) => (
+                  <Table.Td key={label} w="50%">
+                    <Group justify="space-between" wrap="nowrap" align="flex-start">
+                      <Code style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>
+                        {value ?? "—"}
+                      </Code>
+                      <CopyButton value={value ?? ""}>
+                        {({ copied, copy }) => (
+                          <Tooltip label={copied ? "Copied" : `Copy ${label}`}>
+                            <ActionIcon
+                              aria-label={`Copy ${label}`}
+                              color={copied ? "green" : "gray"}
+                              variant="subtle"
+                              disabled={!value}
+                              onClick={copy}
+                            >
+                              {copied ? <IconCheck size={16} /> : <IconCopy size={16} />}
+                            </ActionIcon>
+                          </Tooltip>
+                        )}
+                      </CopyButton>
+                    </Group>
+                  </Table.Td>
+                ))}
+              </Table.Tr>
+            </Table.Tbody>
+          </Table>
+        </Card>
       </Box>
 
       <CloudWatchLogsView resource={resource} />

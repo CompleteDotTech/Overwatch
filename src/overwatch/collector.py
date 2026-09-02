@@ -15,6 +15,7 @@ import gzip
 import json
 import math
 import os
+import shutil
 import threading
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -49,6 +50,8 @@ from overwatch.logs import (
     cloudwatch_event_id,
     cloudwatch_event_message,
     cloudwatch_event_pid,
+    cloudwatch_message_has_application_failure,
+    flow_references_from_cloudwatch_message,
 )
 from overwatch.providers.wandb_flow import match_skypilot_jobs
 from overwatch.utils import enum_value, isoformat
@@ -154,13 +157,11 @@ async def collect_recent_flow_runs(
         run
         for project_runs_result in recent_by_project
         for run in project_runs_result
-        if "/" in (run.name or "")
     ]
     running_candidates = [
         run
         for project_runs_result in running_by_project
         for run in project_runs_result
-        if "/" in (run.name or "")
     ]
     recent_candidates.sort(key=lambda run: run.created_at or "", reverse=True)
     candidates_by_path = {
@@ -243,6 +244,39 @@ def write_json_atomically(path: Path, value: Any) -> None:
     temporary_path.replace(path)
 
 
+def cache_train_config(job_id: int, config_uri: str) -> None:
+    """Materialize one discovered raw TrainConfig beside its job cache."""
+    from typesafe.tspath import TSPath
+
+    train_config_path = raw_cache_path("jobs", str(job_id), "train_config.yaml")
+    source_path = raw_cache_path("jobs", str(job_id), "train_config.source.json")
+    error_path = raw_cache_path("jobs", str(job_id), "train_config.error.json")
+    if train_config_path.exists():
+        return
+    try:
+        tspath = TSPath(config_uri)
+        tspath.sync_down()
+        train_config_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = train_config_path.with_suffix(".yaml.tmp")
+        shutil.copyfile(tspath.local, temporary_path)
+        temporary_path.chmod(0o600)
+        temporary_path.replace(train_config_path)
+        write_json_atomically(
+            source_path,
+            {"uri": config_uri, "updated_at": isoformat(datetime.now(UTC))},
+        )
+        error_path.unlink(missing_ok=True)
+    except Exception as error:  # noqa: BLE001 - storage backends vary by URI
+        write_json_atomically(
+            error_path,
+            {
+                "uri": config_uri,
+                "error": f"{type(error).__name__}: {error}",
+                "updated_at": isoformat(datetime.now(UTC)),
+            },
+        )
+
+
 def read_json(path: Path, default: Any = None) -> Any:
     """Read a cache file, returning a caller-provided value when absent."""
     try:
@@ -288,6 +322,8 @@ def cloudwatch_event_block_metadata(
         process_range["maximum_timestamp"] = max(
             process_range["maximum_timestamp"], timestamp
         )
+        if cloudwatch_message_has_application_failure(cloudwatch_event_message(event)):
+            process_range["application_failure"] = True
     minimum_key = min(event_keys) if event_keys else None
     maximum_key = max(event_keys) if event_keys else None
     return {
@@ -304,12 +340,12 @@ def cloudwatch_event_block_metadata(
 def enrich_cloudwatch_events_index(
     events_path: Path, index_path: Path, index: dict[str, Any]
 ) -> dict[str, Any]:
-    """Add process metadata to indexes created before PID ranges were retained."""
-    if all("processes" in block for block in index["blocks"]):
+    """Add process and failure metadata to older block indexes."""
+    if all(block.get("process_metadata_version") == 2 for block in index["blocks"]):
         return index
     with events_path.open("rb") as events_file:
         for block in index["blocks"]:
-            if "processes" in block:
+            if block.get("process_metadata_version") == 2:
                 continue
             events_file.seek(int(block["compressed_offset"]))
             compressed_block = events_file.read(int(block["compressed_size"]))
@@ -317,6 +353,7 @@ def enrich_cloudwatch_events_index(
                 keepends=True
             )
             block.update(cloudwatch_event_block_metadata(event_lines))
+            block["process_metadata_version"] = 2
     write_json_atomically(index_path, index)
     return index
 
@@ -360,6 +397,7 @@ def append_cloudwatch_event_lines_to_zstd(
                 "first_line": index["line_count"],
                 "line_count": len(lines),
                 **cloudwatch_event_block_metadata(lines),
+                "process_metadata_version": 2,
             }
         )
         index["line_count"] += len(lines)
@@ -830,6 +868,29 @@ def append_cloudwatch_events(
             "human_events_file": human_log_path.name,
             "human_log_format_version": HUMAN_LOG_FORMAT_VERSION,
         }
+
+        # Cache the raw TrainConfig as soon as its URI appears in CloudWatch.
+        if not raw_cache_path("jobs", str(job_id), "train_config.yaml").exists():
+            references = {}
+            for event in appended_event_values:
+                references.update(
+                    flow_references_from_cloudwatch_message(
+                        cloudwatch_event_message(event)
+                    )
+                )
+            if not references.get("config_uri") and events_path.exists():
+                for line in iter_cloudwatch_event_lines_from_file(events_path):
+                    try:
+                        event = json.loads(line)
+                        references.update(
+                            flow_references_from_cloudwatch_message(
+                                cloudwatch_event_message(event)
+                            )
+                        )
+                    except (json.JSONDecodeError, KeyError, TypeError):
+                        continue
+            if config_uri := references.get("config_uri"):
+                cache_train_config(job_id, config_uri)
         write_json_atomically(cursor_path, cursor)
 
         return cursor
@@ -1037,11 +1098,20 @@ async def collect_raw_metrics(
                     job_directory / "wandb.json", serialize_wandb_run(run)
                 )
 
-        # Routine collection advances only active job cursors and never scans history.
+        # Routine collection advances active cursors and enriches old local indexes once.
         active_jobs = [
             serialized_job
             for serialized_job in serialized_jobs
             if enum_value(serialized_job.get("status")) in ACTIVE_SKY_STATUSES
+        ]
+        inactive_aws_job_directories = [
+            raw_cache_path("jobs", str(job["job_id"]), "cloudwatch")
+            for job in serialized_jobs
+            if enum_value(job.get("status")) not in ACTIVE_SKY_STATUSES
+            and str(job.get("cloud", "")).casefold() == "aws"
+            and raw_cache_path(
+                "jobs", str(job["job_id"]), "cloudwatch", "events.jsonl.zst"
+            ).exists()
         ]
         cloudwatch_started = perf_counter()
         cloudwatch_results = await asyncio.gather(
@@ -1049,6 +1119,10 @@ async def collect_raw_metrics(
                 asyncio.to_thread(append_cloudwatch_events, job)
                 for job in active_jobs
                 if str(job.get("cloud", "")).casefold() == "aws"
+            ),
+            *(
+                asyncio.to_thread(ensure_cloudwatch_zstd_cache, job_directory)
+                for job_directory in inactive_aws_job_directories
             ),
             return_exceptions=True,
         )

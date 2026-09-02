@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pyzstd
+import yaml
 
 from overwatch.collector import (
     RAW_CACHE_ROOT,
@@ -31,7 +32,9 @@ from overwatch.logs import (
     cloudwatch_event_id,
     cloudwatch_event_message,
     cloudwatch_event_pid,
+    cloudwatch_message_has_application_failure,
     flow_progress_from_log_text,
+    flow_references_from_cloudwatch_message,
 )
 from overwatch.utils import enum_value
 
@@ -144,6 +147,16 @@ def cached_wandb_runs() -> list[CachedRun]:
             )
         )
     return runs
+
+
+def cached_train_config(job_id: int) -> dict[str, Any]:
+    """Load one raw cached TrainConfig when the collector has materialized it."""
+    path = raw_cache_path("jobs", str(job_id), "train_config.yaml")
+    try:
+        value = yaml.safe_load(path.read_text())
+    except (OSError, yaml.YAMLError):
+        return {}
+    return value if isinstance(value, dict) else {}
 
 
 def billing_category(service: str, sku: str = "") -> str:
@@ -302,9 +315,12 @@ def cached_billing_report(manifest: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def cached_cloudwatch_progress(job_id: int) -> tuple[dict[str, Any] | None, str | None]:
-    """Parse training progress from the latest timestamped cached messages."""
+def cached_cloudwatch_telemetry(
+    job_id: int,
+) -> tuple[dict[str, Any] | None, str | None, dict[str, str]]:
+    """Parse progress and durable training references in one cached-log pass."""
     latest_messages: list[tuple[int, str]] = []
+    references: dict[str, str] = {}
     for line in iter_cached_cloudwatch_event_lines(job_id):
         try:
             event = json.loads(line)
@@ -312,16 +328,22 @@ def cached_cloudwatch_progress(job_id: int) -> tuple[dict[str, Any] | None, str 
             timestamp = int(event["timestamp"])
         except (json.JSONDecodeError, KeyError, TypeError, ValueError):
             continue
+        references.update(flow_references_from_cloudwatch_message(message))
         if "tok/s" in message:
             if len(latest_messages) < 1_000:
                 heapq.heappush(latest_messages, (timestamp, message))
             else:
                 heapq.heappushpop(latest_messages, (timestamp, message))
     if not latest_messages:
-        return None, "no Flow training progress line found in cached CloudWatch events"
-    return flow_progress_from_log_text(
+        return (
+            None,
+            "no Flow training progress line found in cached CloudWatch events",
+            references,
+        )
+    progress, error = flow_progress_from_log_text(
         "\n".join(message for _timestamp, message in sorted(latest_messages))
     )
+    return progress, error, references
 
 
 def cached_cloudwatch_attempts(
@@ -410,6 +432,63 @@ def cached_cloudwatch_attempts(
     for attempt, next_attempt in pairwise(attempts):
         attempt["scan_end_at"] = next_attempt["scan_start_at"]
     return attempts
+
+
+def cached_cloudwatch_retry_breakdown(
+    job_id: int, total_recoveries: int | None
+) -> dict[str, int | None]:
+    """Classify recovered attempts using only cached CloudWatch events."""
+    if total_recoveries is None:
+        return {
+            "preemption_or_infrastructure": None,
+            "application_error": None,
+            "total_recoveries": None,
+        }
+    if total_recoveries <= 0:
+        return {
+            "preemption_or_infrastructure": 0,
+            "application_error": 0,
+            "total_recoveries": total_recoveries,
+        }
+
+    directory = raw_cache_path("jobs", str(job_id), "cloudwatch")
+    events_path = directory / "events.jsonl.zst"
+    index = read_json(directory / "events.index.json", {})
+    application_failure_pids: set[int] = set()
+    indexed_failure_metadata_available = (
+        cloudwatch_events_index_is_valid(events_path, index)
+        and all(block.get("process_metadata_version") == 2 for block in index["blocks"])
+    )
+    if indexed_failure_metadata_available:
+        for block in index["blocks"]:
+            application_failure_pids.update(
+                int(pid)
+                for pid, process in block["processes"].items()
+                if process.get("application_failure")
+            )
+    else:
+        # Legacy indexes are rare; retain correctness until the collector enriches them.
+        for line in iter_cached_cloudwatch_event_lines(job_id):
+            try:
+                event = json.loads(line)
+                pid = cloudwatch_event_pid(event)
+                message = cloudwatch_event_message(event)
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                continue
+            if pid is not None and cloudwatch_message_has_application_failure(message):
+                application_failure_pids.add(pid)
+
+    # Sky supplies the total; explicit cached failures classify recovered attempts.
+    attempts = cached_cloudwatch_attempts(job_id, total_recoveries + 1)
+    recovered_attempts = attempts[:total_recoveries]
+    application_errors = sum(
+        attempt["pid"] in application_failure_pids for attempt in recovered_attempts
+    )
+    return {
+        "preemption_or_infrastructure": total_recoveries - application_errors,
+        "application_error": application_errors,
+        "total_recoveries": total_recoveries,
+    }
 
 
 def cached_cloudwatch_log_page(

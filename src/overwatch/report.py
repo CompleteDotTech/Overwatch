@@ -72,10 +72,11 @@ def estimated_hourly_cost(job: Any) -> tuple[float | None, str | None]:
 
 def gcp_storage_info(
     config_uri: str | None,
+    configured_run_dir: str | None = None,
 ) -> tuple[str | None, str | None, str | None]:
     if config_uri is None:
         return None, None, None
-    run_uri = config_uri.removesuffix("/train_config.yaml")
+    run_uri = configured_run_dir or config_uri.removesuffix("/train_config.yaml")
     if not config_uri.startswith("gs://"):
         return run_uri, None, None
     bucket_and_key = run_uri.removeprefix("gs://")
@@ -196,10 +197,23 @@ def build_run_record(
     log_progress: dict[str, Any] | None,
     progress_error: str | None,
     zymtrace_project_id: str,
+    retry_breakdown: dict[str, int | None] | None = None,
 ) -> dict[str, Any]:
     timing = calculate_progress_and_timing(run, job, log_progress, config)
     config_uri = flow_config_uri_from_run(run, config)
-    run_uri, gcp_bucket, gcp_console_url = gcp_storage_info(config_uri)
+    configured_run_dir = config.get("run_dir")
+    if (
+        not configured_run_dir
+        and config_uri
+        and config.get("attempt") is not None
+        and not config.get("timestamp_run_dir")
+    ):
+        configured_run_dir = (
+            f'{config_uri.removesuffix("/train_config.yaml")}/a{config["attempt"]}'
+        )
+    run_uri, gcp_bucket, gcp_console_url = gcp_storage_info(
+        config_uri, configured_run_dir
+    )
     job_name = job.job_name if job else normalized_wandb_experiment_name(run)
     recovery_count = job.recovery_count if job else None
 
@@ -238,7 +252,8 @@ def build_run_record(
             ),
             "collection_error": progress_error,
         },
-        "retries": {
+        "retries": retry_breakdown
+        or {
             "preemption_or_infrastructure": None,
             "application_error": None,
             "total_recoveries": recovery_count,
@@ -298,14 +313,34 @@ def build_sky_only_record(
     log_progress: dict[str, Any] | None,
     progress_error: str | None,
     zymtrace_project_id: str,
+    retry_breakdown: dict[str, int | None] | None = None,
+    training_references: dict[str, str] | None = None,
+    config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    training_references = training_references or {}
+    config = config or {}
     wandb_url = next(
         (
             url
             for label, url in (job.links or {}).items()
             if "w&b" in label.casefold() or "wandb" in label.casefold()
         ),
-        None,
+        training_references.get("wandb_url"),
+    )
+    wandb_path_parts = wandb_url.rstrip("/").split("/") if wandb_url else []
+    config_uri = training_references.get("config_uri")
+    configured_run_dir = training_references.get("run_uri") or config.get("run_dir")
+    if (
+        not configured_run_dir
+        and config_uri
+        and isinstance(config.get("attempt"), int)
+        and not config.get("timestamp_run_dir")
+    ):
+        configured_run_dir = (
+            f'{config_uri.removesuffix("/train_config.yaml")}/a{config["attempt"]}'
+        )
+    run_uri, gcp_bucket, gcp_console_url = gcp_storage_info(
+        config_uri, configured_run_dir
     )
     completed_batches = log_progress.get("completed_batches") if log_progress else None
     total_batches = log_progress.get("total_batches") if log_progress else None
@@ -327,8 +362,9 @@ def build_sky_only_record(
     return {
         "kind": "managed_job",
         "name": job.job_name,
-        "project": None,
-        "user": job.user_name,
+        "project": config.get("project")
+        or (wandb_path_parts[-3] if len(wandb_path_parts) >= 3 else None),
+        "user": config.get("user") or job.user_name,
         "wandb_id": wandb_url.rstrip("/").rsplit("/", 1)[-1] if wandb_url else None,
         "submitted_at": isoformat(timestamp_from_epoch(job.submitted_at)),
         "status": {"wandb": None, "skypilot": enum_value(job.status)},
@@ -364,7 +400,8 @@ def build_sky_only_record(
             "display": format_progress(completed_batches, total_batches),
             "collection_error": progress_error,
         },
-        "retries": {
+        "retries": retry_breakdown
+        or {
             "preemption_or_infrastructure": None,
             "application_error": None,
             "total_recoveries": recovery_count,
@@ -404,12 +441,16 @@ def build_sky_only_record(
             "cloud": job.cloud,
             "region": job.region,
         },
-        "storage": {"config_uri": None, "run_uri": None, "gcp_bucket": None},
+        "storage": {
+            "config_uri": config_uri,
+            "run_uri": run_uri,
+            "gcp_bucket": gcp_bucket,
+        },
         "links": {
             "wandb": wandb_url,
             "skypilot": f"{sky_server_common.get_server_url()}/dashboard/jobs/{job.job_id}",
             "zymtrace": zymtrace_url(zymtrace_project_id, job.job_name, started_at),
-            "gcp_bucket": None,
+            "gcp_bucket": gcp_console_url,
         },
     }
 

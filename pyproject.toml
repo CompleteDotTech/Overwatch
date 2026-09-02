@@ -11,8 +11,11 @@ dependencies = [
     "google-cloud-bigquery>=3.38",
     "loguru>=0.7",
     "python-dotenv>=1",
+    "pyyaml>=6",
     "pyzstd>=0.19.1",
     "skypilot==0.13.0rc1",
+    "tspath[s3]>=0.2.6",
+    "typesafe>=0.2.2",
     "wandb>=0.29",
     "watchfiles>=1.0",
 ]
@@ -32,7 +35,17 @@ dev = [
 ]
 
 [tool.uv]
+keyring-provider = "subprocess"
 override-dependencies = ["click>=8.2,<8.3"]
+
+[tool.uv.sources]
+typesafe = { index = "tscore" }
+tspath = { index = "tscore" }
+
+[[tool.uv.index]]
+name = "tscore"
+url = "https://aws@typesafe-905418454283.d.codeartifact.us-east-1.amazonaws.com/pypi/tscore/simple/"
+explicit = true
 
 [tool.deptry.package_module_name_map]
 python-dotenv = "dotenv"
