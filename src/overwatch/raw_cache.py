@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import shutil
+import tempfile
 from datetime import UTC, date, datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any
+
+from loguru import logger
 
 from overwatch.utils import isoformat
 
@@ -42,12 +46,27 @@ def json_safe(value: Any) -> Any:
 def write_json_atomically(path: Path, value: Any) -> None:
     """Write one private JSON snapshot without exposing a partial file."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = path.with_suffix(f"{path.suffix}.tmp")
-    temporary_path.write_text(
-        json.dumps(json_safe(value), indent=2, sort_keys=True) + "\n"
-    )
-    temporary_path.chmod(0o600)
-    temporary_path.replace(path)
+    temporary_path: Path | None = None
+    try:
+        # Give overlapping collectors independent staging files in the target directory.
+        with tempfile.NamedTemporaryFile(
+            "w",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+            encoding="utf-8",
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+            json.dump(json_safe(value), temporary_file, indent=2, sort_keys=True)
+            temporary_file.write("\n")
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
+        temporary_path.chmod(0o600)
+        temporary_path.replace(path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 def cache_train_config(job_id: int, config_uri: str) -> None:
@@ -84,8 +103,11 @@ def cache_train_config(job_id: int, config_uri: str) -> None:
 
 
 def read_json(path: Path, default: Any = None) -> Any:
-    """Read a cache file, returning a caller-provided value when absent."""
+    """Read a cache file, returning a caller-provided value when unavailable."""
     try:
         return json.loads(path.read_text())
     except FileNotFoundError:
+        return default
+    except (OSError, json.JSONDecodeError) as error:
+        logger.warning("Ignoring unreadable cache snapshot {}: {}", path, error)
         return default

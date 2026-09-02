@@ -1,6 +1,8 @@
 """Focused regression coverage for Overwatch."""
 
 import asyncio
+import json
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from importlib.resources import files
 from pathlib import Path
@@ -264,6 +266,29 @@ def test_raw_cloudwatch_cache_only_appends_new_events(
     assert '"events_file": "events.jsonl.zst"' in raw_cache.raw_cache_path(
         "jobs", "183", "cloudwatch", "cursor.json"
     ).read_text()
+
+
+def test_raw_cache_snapshots_survive_overlapping_writes_and_corruption(
+    tmp_path: Path,
+) -> None:
+    snapshot_path = tmp_path / "nested" / "snapshot.json"
+    snapshots = [{"writer": writer, "payload": "x" * 100_000} for writer in range(8)]
+
+    # Exercise the overlapping refresh pattern that previously shared one staging path.
+    with ThreadPoolExecutor(max_workers=len(snapshots)) as executor:
+        list(
+            executor.map(
+                lambda value: raw_cache.write_json_atomically(snapshot_path, value),
+                snapshots,
+            )
+        )
+
+    assert json.loads(snapshot_path.read_text()) in snapshots
+    assert list(snapshot_path.parent.glob("*.tmp")) == []
+
+    # A damaged optional snapshot must not take down the report reader.
+    snapshot_path.write_text('{"incomplete":')
+    assert raw_cache.read_json(snapshot_path, {"fallback": True}) == {"fallback": True}
 
 
 def test_cost_scaling_and_packaged_browser_assets(
