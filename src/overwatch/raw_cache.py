@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import math
-import os
 import shutil
 import tempfile
 from datetime import UTC, date, datetime
@@ -60,8 +59,6 @@ def write_json_atomically(path: Path, value: Any) -> None:
             temporary_path = Path(temporary_file.name)
             json.dump(json_safe(value), temporary_file, indent=2, sort_keys=True)
             temporary_file.write("\n")
-            temporary_file.flush()
-            os.fsync(temporary_file.fileno())
         temporary_path.chmod(0o600)
         temporary_path.replace(path)
     finally:
