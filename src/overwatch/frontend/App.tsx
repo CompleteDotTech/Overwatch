@@ -1138,15 +1138,16 @@ export function App() {
         if (statusResponse.ok && !stopped) {
           setQueryStatus((await statusResponse.json()) as QueryStatusReport);
         }
-        if (
-          serviceState.current &&
-          (nextState.startup_id !== serviceState.current.startup_id ||
-            (serviceState.current.report_version !== null &&
-              nextState.report_version !== serviceState.current.report_version))
-        ) {
-          window.location.reload();
-        }
+        const previousState = serviceState.current;
         serviceState.current = nextState;
+        if (previousState && nextState.startup_id !== previousState.startup_id) {
+          window.location.reload();
+        } else if (
+          previousState &&
+          nextState.report_version !== previousState.report_version
+        ) {
+          await loadReport();
+        }
       } catch {
         // The source reloader briefly takes the local service offline.
       }
