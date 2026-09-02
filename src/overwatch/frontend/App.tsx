@@ -1,4 +1,3 @@
-import { BarChart } from "@mantine/charts";
 import {
   ActionIcon,
   Alert,
@@ -39,96 +38,35 @@ import {
   IconCopy,
   IconCurrencyDollar,
   IconDatabase,
-  IconFileText,
   IconSearch,
   IconServer,
 } from "@tabler/icons-react";
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 
+import { BillingPage } from "./BillingPage";
 import { CloudWatchLogsView } from "./CloudWatchLogsView";
+import {
+  ACTIVE_STATUSES,
+  aggregateResourceSpend,
+  findWasteCandidates,
+  resourcesWithRecoveries,
+} from "./costWaste";
+import type { SpendBreakdownRow } from "./costWaste";
+import {
+  formatDuration,
+  formatMoney,
+  formatTimestamp,
+  queryDiagnosticColor,
+  StatCard,
+  statusColor,
+  Warnings,
+} from "./presentation";
 import type {
   ConfigDifference,
   QueryStatusReport,
   Report,
   Resource,
 } from "./types";
-
-const ACTIVE_STATUSES = new Set([
-  "PENDING",
-  "SUBMITTED",
-  "STARTING",
-  "RUNNING",
-  "WINDING_DOWN",
-  "RECOVERING",
-  "CANCELLING",
-  "AUTOSTOPPING",
-  "INIT",
-  "UP",
-]);
-
-function formatMoney(value: number | null | undefined): string {
-  return value == null
-    ? "—"
-    : new Intl.NumberFormat("en-US", {
-        style: "currency",
-        currency: "USD",
-      }).format(value);
-}
-
-function formatTimestamp(value: string | null): string {
-  if (!value) return "—";
-  return new Intl.DateTimeFormat("en-US", {
-    month: "short",
-    day: "numeric",
-    hour: "numeric",
-    minute: "2-digit",
-    timeZone: "America/Los_Angeles",
-    timeZoneName: "short",
-  }).format(new Date(value));
-}
-
-function formatDuration(seconds: number | null): string {
-  if (seconds == null) return "—";
-  const days = Math.floor(seconds / 86400);
-  const hours = Math.floor((seconds % 86400) / 3600);
-  const minutes = Math.floor((seconds % 3600) / 60);
-  return days ? `${days}d ${hours}h ${minutes}m` : `${hours}h ${minutes}m`;
-}
-
-function statusColor(status: string | null): string {
-  if (!status) return "gray";
-  const normalizedStatus = status.toUpperCase();
-  if (["RUNNING", "UP"].includes(normalizedStatus)) return "blue";
-  if (["SUCCEEDED", "FINISHED"].includes(normalizedStatus)) return "green";
-  if (normalizedStatus.startsWith("FAILED") || ["CRASHED", "CANCELLED"].includes(normalizedStatus)) {
-    return "red";
-  }
-  if (["RECOVERING", "AUTOSTOPPING", "STARTING", "INIT", "PENDING"].includes(normalizedStatus)) {
-    return "yellow";
-  }
-  return "gray";
-}
-
-function queryDiagnosticColor(status: QueryStatusReport["queries"][number]["status"]): string {
-  if (status === "ok") return "green";
-  if (status === "warning") return "yellow";
-  if (status === "error") return "red";
-  if (status === "pending") return "blue";
-  return "gray";
-}
-
-function Warnings({ warnings }: { warnings: string[] }) {
-  if (!warnings.length) return null;
-  return (
-    <Stack gap="xs">
-      {warnings.map((warning) => (
-        <Alert key={warning} color="yellow" icon={<IconAlertTriangle size={18} />}>
-          {warning}
-        </Alert>
-      ))}
-    </Stack>
-  );
-}
 
 type Page = "resources" | "billing" | "cost-waste" | "run";
 
@@ -209,97 +147,6 @@ function Navigation({
         </Group>
       </Group>
     </AppShell.Header>
-  );
-}
-
-function StatCard({ label, value, detail }: { label: string; value: string; detail?: string }) {
-  return (
-    <Card withBorder className="hud-stat">
-      <Text c="dimmed" size="xs" tt="uppercase" fw={700}>
-        {label}
-      </Text>
-      <Text fw={800} mt={4} className="hud-stat-value">
-        {value}
-      </Text>
-      {detail && (
-        <Text c="dimmed" size="xs" mt={2}>
-          {detail}
-        </Text>
-      )}
-    </Card>
-  );
-}
-
-function BillingPage({ report }: { report: Report }) {
-  const billing = report.billing;
-  const dateFormatter = new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric" });
-  const categoryData = billing.category_daily.map((day) => ({
-    date: dateFormatter.format(new Date(`${day.date}T00:00:00Z`)),
-    aws_compute: day.aws_compute ?? 0,
-    aws_storage: day.aws_storage ?? 0,
-    aws_everything_else: day.aws_everything_else ?? 0,
-    gcp_compute: day.gcp_compute ?? 0,
-    gcp_storage: day.gcp_storage ?? 0,
-    gcp_everything_else: day.gcp_everything_else ?? 0,
-  }));
-
-  return (
-    <Stack gap="lg">
-      <Box>
-        <Title order={1}>Cloud billing</Title>
-        <Text c="dimmed">
-          {billing.start_date} through {billing.end_date} · daily net spend in USD
-        </Text>
-      </Box>
-      <Warnings warnings={billing.warnings} />
-      {!billing.gcp_configured && (
-        <Alert color="blue" icon={<IconFileText size={18} />}>
-          Set <Code>GCP_BILLING_EXPORT_TABLE</Code> to load per-project GCP billing lines.
-        </Alert>
-      )}
-      <SimpleGrid cols={{ base: 1, sm: 3 }}>
-        <StatCard
-          label="AWS · 30 days"
-          value={formatMoney(billing.totals.aws)}
-          detail={billing.totals.aws == null ? "Unavailable" : "Net unblended cost"}
-        />
-        <StatCard
-          label="GCP · 30 days"
-          value={formatMoney(billing.totals.gcp)}
-          detail={billing.totals.gcp == null ? "Unavailable" : "Cost after credits"}
-        />
-        <StatCard
-          label="Combined · 30 days"
-          value={formatMoney(billing.totals.combined)}
-          detail="Available providers"
-        />
-      </SimpleGrid>
-      <Card withBorder padding="lg">
-        <Box mb="lg">
-          <Title order={3}>Daily spend</Title>
-          <Text c="dimmed" size="sm">
-            Stacked by cloud and major category · recent days may be provisional
-          </Text>
-        </Box>
-        <BarChart
-          h={420}
-          data={categoryData}
-          dataKey="date"
-          type="stacked"
-          series={[
-            { name: "aws_compute", label: "AWS · compute", color: "orange.7" },
-            { name: "aws_storage", label: "AWS · storage", color: "orange.4" },
-            { name: "aws_everything_else", label: "AWS · other", color: "yellow.4" },
-            { name: "gcp_compute", label: "GCP · compute", color: "blue.7" },
-            { name: "gcp_storage", label: "GCP · storage", color: "blue.4" },
-            { name: "gcp_everything_else", label: "GCP · other", color: "cyan.4" },
-          ]}
-          valueFormatter={(value) => formatMoney(value)}
-          withLegend
-          yAxisProps={{ width: 72 }}
-        />
-      </Card>
-    </Stack>
   );
 }
 
@@ -774,12 +621,6 @@ function RunPage({ report, jobId }: { report: Report; jobId: number }) {
   );
 }
 
-interface SpendBreakdownRow {
-  name: string;
-  spend: number;
-  hourly: number;
-}
-
 function SpendBreakdown({ title, rows }: { title: string; rows: SpendBreakdownRow[] }) {
   const largestSpend = Math.max(...rows.map((row) => row.spend), 0);
   return (
@@ -806,60 +647,14 @@ function SpendBreakdown({ title, rows }: { title: string; rows: SpendBreakdownRo
 }
 
 function CostWastePage({ report }: { report: Report }) {
-  const activeResources = report.resources.filter((resource) =>
-    ACTIVE_STATUSES.has(resource.status.skypilot ?? ""),
-  );
-  const gpuPattern = /(gpu|tpu|b200|h200|h100|a100|v100|l40|l4|t4|a10)/i;
-  const wasteCandidates = activeResources.flatMap((resource) => {
-    const reasons: string[] = [];
-    const hasObservedProgress =
-      resource.progress.completed_batches != null || resource.progress.tokens_per_second != null;
-    if (gpuPattern.test(resource.skypilot.resources ?? "") && !hasObservedProgress) {
-      reasons.push("Idle GPU candidate");
-    }
-    if (resource.kind === "managed_job" && resource.wandb_id == null) {
-      reasons.push("Orphan candidate");
-    }
-    if (
-      resource.kind === "cluster" &&
-      (resource.timing.elapsed_seconds ?? 0) >= 2 * 24 * 60 * 60
-    ) {
-      reasons.push("Zombie dev box candidate");
-    }
-    return reasons.length ? [{ resource, reasons }] : [];
-  });
+  const wasteCandidates = findWasteCandidates(report.resources);
   const candidateHourly = wasteCandidates.reduce(
     (sum, candidate) => sum + (candidate.resource.cost.hourly_usd ?? 0),
     0,
   );
-  const recoveries = report.resources
-    .filter(
-      (resource) =>
-        (resource.retries.total_recoveries ?? 0) > 0 ||
-        (resource.retries.preemption_or_infrastructure ?? 0) > 0 ||
-        (resource.retries.application_error ?? 0) > 0,
-    )
-    .sort(
-      (left, right) =>
-        (right.retries.total_recoveries ?? 0) - (left.retries.total_recoveries ?? 0),
-    );
-
-  const aggregateSpend = (labelFor: (resource: Resource) => string) => {
-    const grouped = new Map<string, SpendBreakdownRow>();
-    for (const resource of report.resources) {
-      const name = labelFor(resource);
-      const row = grouped.get(name) ?? { name, spend: 0, hourly: 0 };
-      row.spend += resource.cost.estimated_spend_usd ?? 0;
-      if (ACTIVE_STATUSES.has(resource.status.skypilot ?? "")) {
-        row.hourly += resource.cost.hourly_usd ?? 0;
-      }
-      grouped.set(name, row);
-    }
-    return [...grouped.values()]
-      .filter((row) => row.spend > 0 || row.hourly > 0)
-      .sort((left, right) => right.spend - left.spend);
-  };
-
+  const recoveries = resourcesWithRecoveries(report.resources);
+  const aggregateSpend = (labelFor: (resource: Resource) => string) =>
+    aggregateResourceSpend(report.resources, labelFor);
   return (
     <Stack gap="xl">
       <Box>
