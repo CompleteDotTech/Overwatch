@@ -1,6 +1,7 @@
 """CloudWatch and SkyPilot log collection and parsing."""
 
 import asyncio
+import hashlib
 import html
 import json
 import re
@@ -58,6 +59,14 @@ def cloudwatch_event_pid(event: dict[str, Any]) -> int | None:
             return pid
     match = CLOUDWATCH_PID_RE.search(message)
     return int(match.group("pid")) if match else None
+
+
+def cloudwatch_event_id(event: dict[str, Any]) -> str:
+    """Build a stable identity for deduplicating tail and history responses."""
+    identity = (
+        f"{event['timestamp']}:{event.get('ingestionTime', '')}:{event['message']}"
+    )
+    return hashlib.blake2s(identity.encode(), digest_size=12).hexdigest()
 
 
 def ansi_log_text_to_safe_html(log_text: str) -> str:
@@ -153,6 +162,8 @@ def discover_cloudwatch_attempts(
     cloudwatch_client: Any,
     stream_name: str,
     expected_attempts: int,
+    *,
+    start_timestamp: int | None = None,
 ) -> list[dict[str, Any]]:
     """Discover contiguous workload attempts without scanning the whole stream."""
     response = cloudwatch_client.describe_log_streams(
@@ -171,7 +182,7 @@ def discover_cloudwatch_attempts(
     if stream is None or stream.get("firstEventTimestamp") is None:
         return []
 
-    first_timestamp = int(stream["firstEventTimestamp"])
+    first_timestamp = max(int(stream["firstEventTimestamp"]), start_timestamp or 0)
     last_timestamp = int(stream.get("lastEventTimestamp", first_timestamp))
 
     # Random access by timestamp lets us locate process transitions in logarithmic requests.
@@ -214,7 +225,7 @@ def discover_cloudwatch_attempts(
             if left_pid != right_pid
             and (
                 len(discovered_processes) < expected_attempts
-                or right_timestamp - left_timestamp > 3_600_000
+                or right_timestamp - left_timestamp > 60_000
             )
         ]
         if not intervals:
@@ -267,6 +278,7 @@ def discover_cloudwatch_attempts(
                 "started_at": ordered_samples[first_sample_index][0],
                 "scan_start_at": scan_start_at,
                 "scan_end_at": scan_end_at,
+                "tail_at": ordered_samples[last_sample_index][0],
                 "expected_attempts": expected_attempts,
             }
         )

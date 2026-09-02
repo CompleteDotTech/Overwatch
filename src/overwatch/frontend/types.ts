@@ -122,6 +122,7 @@ export interface QueryStatusReport {
 export interface Report {
   generated_at: string;
   requested_limit: number;
+  raw_cache_root?: string;
   billing: Billing;
   resources: Resource[];
   config_differences: ConfigDifference[];

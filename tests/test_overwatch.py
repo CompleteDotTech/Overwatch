@@ -8,7 +8,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from overwatch import app as overwatch_app
+from overwatch import collector
+from overwatch.cached_metrics import (
+    cached_cloudwatch_attempts,
+    cached_cloudwatch_log_page,
+)
 from overwatch.logs import (
     ansi_log_text_to_safe_html,
     discover_cloudwatch_attempts,
@@ -17,32 +21,12 @@ from overwatch.logs import (
 )
 from overwatch.providers import billing
 from overwatch.providers.sky import collect_managed_jobs, collect_standalone_clusters
+from overwatch.providers.wandb_flow import match_skypilot_jobs
 from overwatch.report import (
     build_cluster_record,
     build_sky_only_record,
     estimated_hourly_cost,
 )
-
-
-def test_report_state_cache_round_trips_private_raw_diagnostics(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    cache_path = tmp_path / "state.json"
-    monkeypatch.setattr(overwatch_app, "STATE_CACHE_PATH", cache_path)
-    state = {
-        "report": {"generated_at": "2026-09-01T00:00:00+00:00", "resources": []},
-        "report_error": None,
-        "refresh": {"last_success_at": "2026-09-01T00:00:00+00:00"},
-        "query_diagnostics": {"sky_jobs": {"raw_output": [{"job_id": 183}]}},
-    }
-
-    overwatch_app.persist_report_state(state)
-    restored_state = overwatch_app.load_persisted_report_state()
-
-    assert restored_state is not None
-    assert restored_state["report"] == state["report"]
-    assert restored_state["query_diagnostics"] == state["query_diagnostics"]
-    assert cache_path.stat().st_mode & 0o777 == 0o600
 
 
 def test_log_parsing_smooths_throughput_and_escapes_ansi_html() -> None:
@@ -62,6 +46,31 @@ def test_log_parsing_smooths_throughput_and_escapes_ansi_html() -> None:
         '<span style="color:#cd3131">&lt;script&gt;bad&lt;/script&gt;</span>'
     )
 
+
+def test_wandb_matching_prefers_exact_haiku_name_then_normalizes_both_sides() -> None:
+    run = SimpleNamespace(
+        name="stage/q3_seed4_v2__loud_post",
+        url="https://wandb.ai/entity/project/runs/run-id",
+        state="running",
+        created_at="2026-09-01T23:24:56Z",
+    )
+    exact_job = SimpleNamespace(
+        job_id=187,
+        job_name="q3_seed4_v2__loud_post",
+        links={"W&B Run": run.url},
+        status="RUNNING",
+        submitted_at=2,
+    )
+    resumed_job = SimpleNamespace(
+        job_id=186,
+        job_name="q3_seed4_v2__avid_park",
+        links={},
+        status="RUNNING",
+        submitted_at=1,
+    )
+
+    assert match_skypilot_jobs([run], [resumed_job, exact_job]) == [exact_job]
+    assert match_skypilot_jobs([run], [resumed_job]) == [resumed_job]
 
 def test_cloudwatch_progress_uses_one_bounded_latest_tail_request() -> None:
     requests = []
@@ -142,7 +151,123 @@ def test_cloudwatch_attempt_discovery_finds_each_process_without_full_scan() -> 
 
     assert [attempt["pid"] for attempt in discovered] == [11, 22, 33]
     assert [attempt["attempt"] for attempt in discovered] == [1, 2, 3]
+    assert 1_000 <= discovered[0]["tail_at"] < 401_000
+    assert 401_000 <= discovered[1]["tail_at"] < 801_000
+    assert 801_000 <= discovered[2]["tail_at"] <= 1_200_000
     assert all(request["limit"] == 100 for request in requests)
+
+    # A new recovery resumes discovery at the last cached process instead of rescanning history.
+    requests.clear()
+    suffix = discover_cloudwatch_attempts(
+        CloudWatchClient(), "stream", 2, start_timestamp=401_000
+    )
+    assert [attempt["pid"] for attempt in suffix] == [22, 33]
+    assert all(int(request["startTime"]) >= 401_000 for request in requests)
+
+
+def test_raw_cloudwatch_cache_only_appends_new_events(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    responses = [
+        {
+            "events": [
+                {"timestamp": 1_000, "ingestionTime": 1_001, "message": '{"pid":11,"log":"one"}'},
+                {"timestamp": 2_000, "ingestionTime": 2_001, "message": '{"pid":11,"log":"two"}'},
+            ],
+            "nextForwardToken": "first",
+        },
+        {"events": [], "nextForwardToken": "first"},
+        {
+            "events": [
+                {"timestamp": 3_000, "ingestionTime": 3_001, "message": '{"pid":22,"log":"three"}'},
+            ],
+            "nextForwardToken": "second",
+        },
+        {"events": [], "nextForwardToken": "second"},
+        {
+            "events": [
+                {"timestamp": 1_000, "ingestionTime": 1_001, "message": '{"pid":11,"log":"one"}'},
+                {"timestamp": 2_000, "ingestionTime": 2_001, "message": '{"pid":11,"log":"two"}'},
+                {"timestamp": 3_000, "ingestionTime": 3_001, "message": '{"pid":22,"log":"three"}'},
+            ],
+            "nextForwardToken": "complete",
+        },
+        {"events": [], "nextForwardToken": "complete"},
+    ]
+
+    class CloudWatchClient:
+        def describe_log_streams(self, **_kwargs: object) -> dict[str, object]:
+            return {
+                "logStreams": [
+                    {"logStreamName": "skypilot-cluster-worker", "lastEventTimestamp": 3_000}
+                ]
+            }
+
+        def get_log_events(self, **_kwargs: object) -> dict[str, object]:
+            return responses.pop(0)
+
+    # Replace the cache root and AWS client so append/cursor behavior is deterministic.
+    monkeypatch.setattr(collector, "RAW_CACHE_ROOT", tmp_path / "raw-v1")
+    monkeypatch.setattr(collector.boto3, "client", lambda *_args, **_kwargs: CloudWatchClient())
+    job = {
+        "job_id": 183,
+        "status": "RUNNING",
+        "cloud": "aws",
+        "links": {"AWS Instances": "https://example.test/?tag:ray-cluster-name=cluster"},
+    }
+    legacy_events_path = collector.raw_cache_path(
+        "jobs", "183", "cloudwatch", "events.jsonl"
+    )
+    legacy_events_path.parent.mkdir(parents=True)
+    legacy_events_path.write_text(
+        '{"timestamp":1000,"ingestionTime":1001,"message":"{\\"pid\\":11,\\"log\\":\\"one\\"}"}\n'
+    )
+
+    collector.append_cloudwatch_events(job)
+    collector.append_cloudwatch_events(job)
+
+    events_path = collector.raw_cache_path(
+        "jobs", "183", "cloudwatch", "events.jsonl.zst"
+    )
+    events_index_path = events_path.with_name("events.index.json")
+    human_log_path = events_path.with_name("events.log")
+    assert not legacy_events_path.exists()
+    assert sum(1 for _line in collector.iter_cloudwatch_event_lines_from_file(events_path)) == 3
+    assert '"format": "jsonl-zstd-frames-v1"' in events_index_path.read_text()
+    assert "1970-01-01T00:00:03.000Z pid=22 | three" in human_log_path.read_text()
+    assert [attempt["pid"] for attempt in cached_cloudwatch_attempts(183, 2)] == [11, 22]
+    newest_page = cached_cloudwatch_log_page(183, limit=2)
+    assert [item["timestamp"] for item in newest_page["events"]] == [2_000, 3_000]
+    assert newest_page["has_older"] is True
+    oldest_page = cached_cloudwatch_log_page(
+        183, before=newest_page["oldest_cursor"], limit=2
+    )
+    assert [item["timestamp"] for item in oldest_page["events"]] == [1_000]
+    assert oldest_page["has_older"] is False
+    newer_page = cached_cloudwatch_log_page(
+        183, after=oldest_page["newest_cursor"], limit=2
+    )
+    assert [item["timestamp"] for item in newer_page["events"]] == [2_000, 3_000]
+    assert newer_page["has_older"] is True
+    assert newer_page["has_newer"] is False
+    first_page = cached_cloudwatch_log_page(183, from_start=True, limit=2)
+    assert [item["timestamp"] for item in first_page["events"]] == [1_000, 2_000]
+    assert first_page["has_older"] is False
+    assert first_page["has_newer"] is True
+    cursor_text = collector.raw_cache_path("jobs", "183", "cloudwatch", "cursor.json").read_text()
+    assert '\n  "next_forward_token": "second"' in cursor_text
+
+    # A terminal full-history pass retains the same appendable indexed Zstandard cache.
+    job["status"] = "SUCCEEDED"
+    collector.append_cloudwatch_events(job, full_logs=True)
+
+    assert events_path.exists()
+    assert events_index_path.exists()
+    assert human_log_path.exists()
+    assert [attempt["pid"] for attempt in cached_cloudwatch_attempts(183, 2)] == [11, 22]
+    assert '"events_file": "events.jsonl.zst"' in collector.raw_cache_path(
+        "jobs", "183", "cloudwatch", "cursor.json"
+    ).read_text()
 
 
 def test_cost_scaling_and_packaged_browser_assets(

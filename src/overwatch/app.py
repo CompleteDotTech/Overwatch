@@ -15,21 +15,16 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import math
 import os
 import subprocess
 import sys
 import uuid
-from datetime import UTC, date, datetime, timedelta
-from enum import Enum
+from datetime import UTC, datetime, timedelta
 from importlib.resources import files
 from pathlib import Path
 from time import perf_counter
 from typing import Any
-from urllib.parse import urlparse
 
-import boto3
-import wandb
 from aiohttp import web
 from dotenv import load_dotenv
 from loguru import logger
@@ -38,21 +33,9 @@ from watchfiles import DefaultFilter, run_process
 from overwatch.constants import (
     ACTIVE_RESOURCE_STATUSES,
     ACTIVE_SKY_STATUSES,
-    CLOUDWATCH_LOG_GROUP,
-    CLOUDWATCH_REGION,
     DEFAULT_ZYMTRACE_PROJECT_ID,
 )
-from overwatch.logs import (
-    ansi_log_text_to_safe_html,
-    cloudwatch_event_message,
-    cloudwatch_event_pid,
-    discover_cloudwatch_attempts,
-    progress_from_job_log,
-    resolve_cloudwatch_stream_name,
-)
-from overwatch.providers.billing import collect_daily_cloud_spend
-from overwatch.providers.sky import collect_managed_jobs, collect_standalone_clusters
-from overwatch.providers.wandb_flow import collect_recent_flow_runs, match_skypilot_jobs
+from overwatch.providers.wandb_flow import match_skypilot_jobs
 from overwatch.report import (
     build_cluster_record,
     build_run_record,
@@ -68,72 +51,6 @@ QUERY_LABELS = {
     "wandb": "W&B training runs",
     "cloudwatch": "CloudWatch progress",
 }
-STATE_CACHE_VERSION = 1
-STATE_CACHE_PATH = (
-    Path.home() / "Library" / "Caches" / "Overwatch" / "state-v1.json"
-    if sys.platform == "darwin"
-    else Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
-    / "overwatch"
-    / "state-v1.json"
-)
-
-
-def json_safe_query_output(value: Any) -> Any:
-    """Convert provider objects into inspectable JSON-compatible values."""
-    if hasattr(value, "model_dump"):
-        return json_safe_query_output(value.model_dump(mode="json"))
-    if isinstance(value, dict):
-        return {str(key): json_safe_query_output(child) for key, child in value.items()}
-    if isinstance(value, (list, tuple, set)):
-        return [json_safe_query_output(child) for child in value]
-    if isinstance(value, Enum):
-        return json_safe_query_output(value.value)
-    if isinstance(value, (datetime, date)):
-        return value.isoformat()
-    if isinstance(value, float) and not math.isfinite(value):
-        return str(value)
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    return str(value)
-
-
-def persist_report_state(state: dict[str, Any]) -> None:
-    """Atomically persist the report and its raw query diagnostics."""
-    payload = {
-        "version": STATE_CACHE_VERSION,
-        "saved_at": isoformat(datetime.now(UTC)),
-        "report": state["report"],
-        "report_error": state["report_error"],
-        "refresh": state["refresh"],
-        "query_diagnostics": state["query_diagnostics"],
-        "log_attempts": state.get("log_attempts", {}),
-    }
-    STATE_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = STATE_CACHE_PATH.with_suffix(".tmp")
-    temporary_path.write_text(
-        json.dumps(json_safe_query_output(payload), separators=(",", ":"))
-    )
-    temporary_path.chmod(0o600)
-    temporary_path.replace(STATE_CACHE_PATH)
-
-
-def load_persisted_report_state() -> dict[str, Any] | None:
-    """Load a compatible cached report without making startup depend on it."""
-    try:
-        payload = json.loads(STATE_CACHE_PATH.read_text())
-    except FileNotFoundError:
-        return None
-    except (OSError, json.JSONDecodeError, TypeError) as error:
-        logger.warning("Ignoring unreadable Overwatch state cache: {}", error)
-        return None
-    if payload.get("version") != STATE_CACHE_VERSION:
-        logger.warning("Ignoring incompatible Overwatch state cache.")
-        return None
-    required_fields = {"report", "report_error", "refresh", "query_diagnostics"}
-    if not required_fields.issubset(payload):
-        logger.warning("Ignoring incomplete Overwatch state cache.")
-        return None
-    return payload
 
 
 def build_frontend_assets_if_sources_are_newer() -> None:
@@ -238,305 +155,115 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-async def collect_report(
+async def collect_report_from_raw_cache(
     args: argparse.Namespace,
     *,
     log_progress: bool = False,
     query_diagnostics: dict[str, dict[str, Any]] | None = None,
+    refresh_cache: bool = True,
 ) -> dict[str, Any]:
-    collection_started = perf_counter()
+    """Refresh the standalone collector, then build a report only from cache files."""
+    from overwatch.cached_metrics import (
+        cached_billing_report,
+        cached_cloudwatch_progress,
+        cached_sky_clusters,
+        cached_sky_jobs,
+        cached_wandb_runs,
+        raw_cache_manifest,
+    )
+    from overwatch.collector import (
+        CollectorOptions,
+        collect_raw_metrics,
+        raw_cache_path,
+    )
 
-    def record_query(
-        key: str,
-        status: str,
-        summary: str,
-        *,
-        duration_seconds: float | None = None,
-        raw_output: Any = None,
-        error: BaseException | None = None,
-    ) -> None:
-        if query_diagnostics is None:
-            return
-        previous_diagnostic = query_diagnostics.get(key, {})
-        preserve_raw_output = raw_output is None and status in {"pending", "error"}
-        raw_output_updated_at = (
-            previous_diagnostic.get("raw_output_updated_at")
-            if preserve_raw_output
-            else isoformat(datetime.now(UTC))
-        )
-        query_diagnostics[key] = {
-            "key": key,
-            "label": QUERY_LABELS[key],
-            "status": status,
-            "summary": summary,
-            "updated_at": isoformat(datetime.now(UTC)),
-            "duration_seconds": (
-                round(duration_seconds, 2) if duration_seconds is not None else None
-            ),
-            "error": f"{type(error).__name__}: {error}" if error else None,
-            "raw_output_updated_at": raw_output_updated_at,
-            "raw_output": (
-                previous_diagnostic.get("raw_output")
-                if preserve_raw_output
-                else json_safe_query_output(raw_output)
-            ),
-        }
-
-    async def run_timed_thread_query(
-        function: Any, *arguments: Any
-    ) -> tuple[Any, Exception | None, float]:
-        query_started = perf_counter()
-        try:
-            return (
-                await asyncio.to_thread(function, *arguments),
-                None,
-                perf_counter() - query_started,
-            )
-        except Exception as error:  # noqa: BLE001
-            return None, error, perf_counter() - query_started
-
-    # Mark every source pending so a stalled query is visible while refresh is active.
-    for query_key in QUERY_LABELS:
-        record_query(query_key, "pending", "Waiting for query")
-
-    # Match `uv run` credential loading when the globally installed executable runs directly.
-    if uv_env_file := os.environ.get("UV_ENV_FILE"):
-        load_dotenv(uv_env_file)
-    if log_progress:
-        logger.info("Loading the complete SkyPilot job and cluster inventory…")
-    jobs_query, clusters_query, billing_query = await asyncio.gather(
-        run_timed_thread_query(collect_managed_jobs),
-        run_timed_thread_query(collect_standalone_clusters),
-        run_timed_thread_query(
-            collect_daily_cloud_spend,
+    options = CollectorOptions(
+        limit=args.limit,
+        entity=args.entity,
+        gcp_billing_table=(
             getattr(args, "gcp_billing_table", None)
-            or os.environ.get("GCP_BILLING_EXPORT_TABLE"),
+            or os.environ.get("GCP_BILLING_EXPORT_TABLE")
         ),
     )
-    jobs_result, jobs_error, jobs_duration = jobs_query
-    clusters_result, clusters_error, clusters_duration = clusters_query
-    billing_result, billing_error, billing_duration = billing_query
-
-    # Preserve independent provider results even when an authoritative inventory query fails.
-    if jobs_error is not None:
-        record_query(
-            "sky_jobs",
-            "error",
-            "Query failed",
-            duration_seconds=jobs_duration,
-            error=jobs_error,
-        )
-    else:
-        record_query(
-            "sky_jobs",
-            "ok",
-            f"{len(jobs_result)} jobs",
-            duration_seconds=jobs_duration,
-            raw_output=jobs_result,
-        )
-    if clusters_error is not None:
-        record_query(
-            "sky_clusters",
-            "error",
-            "Query failed",
-            duration_seconds=clusters_duration,
-            error=clusters_error,
-        )
-    else:
-        record_query(
-            "sky_clusters",
-            "ok",
-            f"{len(clusters_result)} clusters",
-            duration_seconds=clusters_duration,
-            raw_output=clusters_result,
-        )
-    if billing_error is not None:
-        record_query(
-            "billing",
-            "error",
-            "Query failed",
-            duration_seconds=billing_duration,
-            error=billing_error,
-        )
-    else:
-        billing_status = "warning" if billing_result["warnings"] else "ok"
-        record_query(
-            "billing",
-            billing_status,
-            "; ".join(billing_result["warnings"]) or "Billing query completed",
-            duration_seconds=billing_duration,
-            raw_output=billing_result,
-        )
-
-    fatal_queries = [
-        (QUERY_LABELS[key], error)
-        for key, error in (
-            ("sky_jobs", jobs_error),
-            ("sky_clusters", clusters_error),
-            ("billing", billing_error),
-        )
-        if error is not None
-    ]
-    if fatal_queries:
-        raise RuntimeError(
-            "; ".join(f"{label}: {error}" for label, error in fatal_queries)
-        )
-    jobs = jobs_result
-    clusters = clusters_result
-    billing = billing_result
     if log_progress:
-        logger.info(
-            "Found {} managed jobs and {} standalone clusters ({:.1f}s).",
-            len(jobs),
-            len(clusters),
-            perf_counter() - collection_started,
-        )
+        logger.info("Refreshing the versioned raw metric cache…")
+    if refresh_cache:
+        await collect_raw_metrics(options)
+    manifest = raw_cache_manifest()
 
-    # W&B is optional enrichment: a telemetry failure must never remove Sky resources.
-    global_warnings = list(billing["warnings"])
-    wandb_started = perf_counter()
-    if log_progress:
-        logger.info(
-            "Loading up to {} recent W&B training runs for enrichment…", args.limit
-        )
-    try:
-        api = await asyncio.to_thread(wandb.Api, timeout=30)
-        entity = args.entity or api.default_entity
-        runs = await collect_recent_flow_runs(api, entity, args.limit)
-
-        # Hydrate scheduler-advertised runs even after they age out of the recent-run window.
-        selected_wandb_ids = {run.id for run in runs}
-        linked_wandb_paths = set()
-        for job in jobs:
-            for linked_url in (job.links or {}).values():
-                parsed_url = urlparse(linked_url)
-                path_parts = parsed_url.path.strip("/").split("/")
-                if (
-                    parsed_url.hostname in {"wandb.ai", "app.wandb.ai"}
-                    and len(path_parts) >= 4
-                    and path_parts[-2] == "runs"
-                    and path_parts[-1] not in selected_wandb_ids
-                ):
-                    linked_wandb_paths.add(
-                        f"{path_parts[-4]}/{path_parts[-3]}/{path_parts[-1]}"
-                    )
-        linked_wandb_results = await asyncio.gather(
-            *(
-                asyncio.to_thread(api.run, linked_wandb_path)
-                for linked_wandb_path in linked_wandb_paths
-            ),
-            return_exceptions=True,
-        )
-        runs.extend(
-            linked_run
-            for linked_run in linked_wandb_results
-            if not isinstance(linked_run, BaseException)
-            and linked_run.config.get("_id_") == "TrainConfig"
-        )
-        record_query(
-            "wandb",
-            "ok",
-            f"{len(runs)} runs",
-            duration_seconds=perf_counter() - wandb_started,
-            raw_output=[
-                {
-                    "id": run.id,
-                    "name": run.name,
-                    "path": list(run.path),
-                    "state": run.state,
-                    "created_at": run.created_at,
-                    "url": run.url,
-                    "config": dict(run.config),
-                }
-                for run in runs
-            ],
-        )
-    # W&B is non-authoritative; any client failure must leave cloud inventory visible.
-    except Exception as error:  # noqa: BLE001
-        runs = []
-        entity = args.entity
-        global_warnings.append(f"Could not collect W&B enrichment: {error}")
-        record_query(
-            "wandb",
-            "error",
-            "Query failed",
-            duration_seconds=perf_counter() - wandb_started,
-            error=error,
-        )
-        if log_progress:
-            logger.warning("W&B enrichment is unavailable: {}", error)
-    if log_progress:
-        logger.info(
-            "W&B enrichment returned {} runs ({:.1f}s).",
-            len(runs),
-            perf_counter() - wandb_started,
-        )
-
+    # Load every presentation input from files written by the collector.
+    jobs = cached_sky_jobs()
+    clusters = cached_sky_clusters()
+    runs = cached_wandb_runs()
+    billing = cached_billing_report(manifest)
     matched_jobs = match_skypilot_jobs(runs, jobs)
     matched_jobs_by_id = {job.job_id: job for job in matched_jobs if job is not None}
-    active_jobs_by_id = {
-        job.job_id: job for job in jobs if enum_value(job.status) in ACTIVE_SKY_STATUSES
-    }
     jobs_for_progress = (
-        {} if args.no_log_enrichment else matched_jobs_by_id | active_jobs_by_id
+        {}
+        if args.no_log_enrichment
+        else {
+            job.job_id: job
+            for job in jobs
+            if job.job_id in matched_jobs_by_id
+            or enum_value(job.status) in ACTIVE_SKY_STATUSES
+        }
     )
-    log_started = perf_counter()
-    if log_progress:
-        message = (
-            f"Enriching {len(jobs_for_progress)} jobs from CloudWatch logs"
-            if jobs_for_progress
-            else "Skipping log enrichment"
-        )
-        logger.info("{}…", message)
-    cloudwatch_client = boto3.client("logs", region_name=CLOUDWATCH_REGION)
-    log_semaphore = asyncio.Semaphore(8)
-    log_values = await asyncio.gather(
-        *(
-            progress_from_job_log(job, cloudwatch_client, log_semaphore)
-            for job in jobs_for_progress.values()
-        )
-    )
-    log_results = dict(zip(jobs_for_progress, log_values))
-    if args.no_log_enrichment:
-        record_query(
-            "cloudwatch",
-            "skipped",
-            "Disabled by --no-log-enrichment",
-            duration_seconds=perf_counter() - log_started,
-        )
-    else:
-        cloudwatch_errors = [error for _progress, error in log_values if error]
-        record_query(
-            "cloudwatch",
-            "warning" if cloudwatch_errors else "ok",
-            (
-                f"{len(log_values) - len(cloudwatch_errors)}/{len(log_values)} jobs enriched"
-                if log_values
-                else "No jobs required enrichment"
-            ),
-            duration_seconds=perf_counter() - log_started,
-            raw_output={
-                str(job_id): {"progress": progress, "error": error}
-                for job_id, (progress, error) in log_results.items()
-            },
-        )
-    if log_progress:
-        logger.info("Log enrichment finished ({:.1f}s).", perf_counter() - log_started)
+    log_results = {
+        job_id: cached_cloudwatch_progress(job_id) for job_id in jobs_for_progress
+    }
 
-    records = []
+    # Query diagnostics reference the raw files instead of duplicating SDK dumps in memory.
+    if query_diagnostics is not None:
+        source_mapping = {
+            "sky_jobs": ("sky_jobs", [raw_cache_path("global", "sky", "jobs.json")]),
+            "sky_clusters": (
+                "sky_clusters",
+                [raw_cache_path("global", "sky", "clusters.json")],
+            ),
+            "billing": (
+                "aws_billing",
+                [
+                    raw_cache_path("global", "billing", "aws.json"),
+                    raw_cache_path("global", "billing", "gcp.json"),
+                ],
+            ),
+            "wandb": ("wandb", [raw_cache_path("global", "wandb", "runs.json")]),
+            "cloudwatch": (
+                "cloudwatch",
+                [raw_cache_path("jobs", str(job_id), "cloudwatch", "cursor.json") for job_id in jobs_for_progress],
+            ),
+        }
+        for query_key, (source_key, paths) in source_mapping.items():
+            source = manifest.get("sources", {}).get(source_key, {})
+            error = source.get("error")
+            existing_paths = [str(path) for path in paths if path.exists()]
+            query_diagnostics[query_key] = {
+                "key": query_key,
+                "label": QUERY_LABELS[query_key],
+                "status": "error" if error else "ok",
+                "summary": error or f"Cached in {len(existing_paths)} raw file(s)",
+                "updated_at": manifest.get("updated_at"),
+                "duration_seconds": source.get("duration_seconds"),
+                "error": error,
+                "raw_output_updated_at": manifest.get("updated_at"),
+                "raw_output": None,
+                "raw_files": existing_paths,
+            }
+
+    # Match cached scheduler and W&B records, then derive the UI report locally.
     matched_runs_by_job_id = {
         job.job_id: (run, dict(run.config))
         for run, job in zip(runs, matched_jobs)
         if job is not None
     }
+    records = []
     matched_records = []
     matched_configs = []
     for job in jobs:
-        matched_run = matched_runs_by_job_id.get(job.job_id)
-        job_log_progress, progress_error = (
-            log_results.get(job.job_id, (None, None)) if job else (None, None)
+        job_log_progress, progress_error = log_results.get(
+            job.job_id, (None, "CloudWatch cache was not requested")
         )
-        if matched_run is not None:
+        if matched_run := matched_runs_by_job_id.get(job.job_id):
             run, config = matched_run
             record = build_run_record(
                 run,
@@ -556,27 +283,27 @@ async def collect_report(
                 args.zymtrace_project_id,
             )
         records.append(record)
-
-    differences = config_differences(matched_records, matched_configs)
     records.extend(
         build_cluster_record(cluster, args.zymtrace_project_id) for cluster in clusters
     )
-
-    def active_record_sort_key(record: dict[str, Any]) -> tuple[bool, str]:
-        is_active = record["status"]["skypilot"] in ACTIVE_RESOURCE_STATUSES
-        return is_active, record["submitted_at"] or ""
-
-    records.sort(key=active_record_sort_key, reverse=True)
+    records.sort(
+        key=lambda record: (
+            record["status"]["skypilot"] in ACTIVE_RESOURCE_STATUSES,
+            record["submitted_at"] or "",
+        ),
+        reverse=True,
+    )
     return {
-        "generated_at": isoformat(datetime.now(UTC)),
-        "wandb_entity": entity,
+        "generated_at": manifest.get("updated_at") or isoformat(datetime.now(UTC)),
+        "wandb_entity": runs[0].entity if runs else args.entity,
         "requested_limit": args.limit,
-        "selection": "active and recent SkyPilot jobs and standalone clusters, optionally enriched with training data",
+        "selection": "raw file cache",
         "log_enrichment": not args.no_log_enrichment,
         "billing": billing,
         "resources": records,
-        "config_differences": differences,
-        "warnings": global_warnings,
+        "config_differences": config_differences(matched_records, matched_configs),
+        "warnings": billing["warnings"],
+        "raw_cache_root": manifest.get("cache_root"),
     }
 
 
@@ -620,6 +347,16 @@ async def handle_raw_query_output(request: web.Request) -> web.Response:
     diagnostic = request.app["state"]["query_diagnostics"].get(query_key)
     if diagnostic is None:
         raise web.HTTPNotFound(text=f"Unknown query: {query_key}")
+    raw_output = diagnostic["raw_output"]
+    if diagnostic.get("raw_files"):
+        raw_output = []
+        for raw_file in diagnostic["raw_files"]:
+            path = Path(raw_file)
+            try:
+                value = json.loads(path.read_text())
+            except (OSError, json.JSONDecodeError) as error:
+                value = {"read_error": f"{type(error).__name__}: {error}"}
+            raw_output.append({"path": raw_file, "value": value})
     return web.json_response(
         {
             "key": query_key,
@@ -629,61 +366,161 @@ async def handle_raw_query_output(request: web.Request) -> web.Response:
             "updated_at": diagnostic["updated_at"],
             "duration_seconds": diagnostic["duration_seconds"],
             "raw_output_updated_at": diagnostic["raw_output_updated_at"],
-            "output": diagnostic["raw_output"],
+            "output": raw_output,
         }
     )
 
 
-async def handle_log_stream(request: web.Request) -> web.StreamResponse:
-    job_id = int(request.match_info["job_id"])
-    report = request.app["state"]["report"]
-    record = (
-        next(
-            (
-                record
-                for record in report["resources"]
-                if record["skypilot"]["job_id"] == job_id
-            ),
-            None,
-        )
-        if report
-        else None
+def resource_record_for_job(
+    app: web.Application, job_id: int
+) -> dict[str, Any] | None:
+    """Find one managed-job report record without consulting a provider."""
+    report = app["state"]["report"]
+    if report is None:
+        return None
+    return next(
+        (
+            record
+            for record in report["resources"]
+            if record["skypilot"].get("job_id") == job_id
+        ),
+        None,
     )
-    if record is None or not record["skypilot"].get("cluster_name"):
-        raise web.HTTPNotFound(text="CloudWatch logs are unavailable for this job")
 
-    cloudwatch_client = request.app["cloudwatch_client"]
-    stream_name = await asyncio.to_thread(
-        resolve_cloudwatch_stream_name,
-        cloudwatch_client,
-        record["skypilot"]["cluster_name"],
-    )
-    if stream_name is None:
-        raise web.HTTPNotFound(text="CloudWatch log stream was not found")
 
-    attempt_number = int(request.query.get("attempt", "0"))
-    attempt = None
-    attempt_is_live = False
-    if attempt_number:
-        cache_entry = await cloudwatch_attempts_for_record(
-            request.app, record, stream_name
-        )
-        attempt = next(
-            (
-                item
-                for item in cache_entry["attempts"]
-                if item["attempt"] == attempt_number
-            ),
-            None,
-        )
-        if attempt is None:
-            raise web.HTTPNotFound(
-                text=f"CloudWatch attempt {attempt_number} was not found"
+def ensure_cached_log_history_task(
+    app: web.Application, job_id: int
+) -> asyncio.Task[dict[str, Any]]:
+    """Run one collector-owned full-log backfill per job at a time."""
+    from overwatch.collector import collect_raw_metrics
+
+    cache_key = str(job_id)
+    task = app["log_attempt_tasks"].get(cache_key)
+    if task is None or task.done():
+        task = asyncio.create_task(
+            collect_raw_metrics(
+                app["collector_options"], job_id=job_id, full_logs=True
             )
-        attempt_is_live = (
-            attempt["scan_end_at"] is None
-            and record["status"].get("skypilot") in ACTIVE_SKY_STATUSES
         )
+        app["log_attempt_tasks"][cache_key] = task
+    return task
+
+
+def ensure_cached_log_refresh_task(
+    app: web.Application, job_id: int
+) -> asyncio.Task[dict[str, Any]]:
+    """Start one non-blocking collector cursor refresh per job."""
+    from overwatch.collector import collect_raw_metrics
+
+    cache_key = str(job_id)
+    task = app["log_refresh_tasks"].get(cache_key)
+    if task is None or task.done():
+        task = asyncio.create_task(
+            collect_raw_metrics(app["collector_options"], job_id=job_id)
+        )
+        app["log_refresh_tasks"][cache_key] = task
+    return task
+
+
+async def handle_cached_log_attempts(request: web.Request) -> web.Response:
+    """List attempts derived from raw cache files while history fills in."""
+    from overwatch.cached_metrics import cached_cloudwatch_attempts
+    from overwatch.collector import raw_cache_path, read_json
+
+    job_id = int(request.match_info["job_id"])
+    record = resource_record_for_job(request.app, job_id)
+    if record is None:
+        raise web.HTTPNotFound(text="Cached logs are unavailable for this job")
+    if str(record["skypilot"].get("cloud") or "").casefold() != "aws":
+        raise web.HTTPNotFound(text="CloudWatch is unavailable for this job")
+    expected_attempts = (record["retries"].get("total_recoveries") or 0) + 1
+    cursor = read_json(
+        raw_cache_path("jobs", str(job_id), "cloudwatch", "cursor.json"), {}
+    )
+    task = request.app["log_attempt_tasks"].get(str(job_id))
+    if not cursor.get("complete_from_head"):
+        task = ensure_cached_log_history_task(request.app, job_id)
+
+    # Reuse attempt metadata while a large raw history file is actively growing.
+    attempt_cache = request.app["log_attempt_cache"]
+    if cursor.get("backfill_in_progress") and str(job_id) in attempt_cache:
+        attempts = attempt_cache[str(job_id)]
+    else:
+        attempts = cached_cloudwatch_attempts(job_id, expected_attempts)
+        attempt_cache[str(job_id)] = attempts
+    active = record["status"].get("skypilot") in ACTIVE_SKY_STATUSES
+    attempt_items = [
+        {
+            "attempt": attempt["attempt"],
+            "pid": attempt["pid"],
+            "started_at": datetime.fromtimestamp(
+                attempt["started_at"] / 1000, UTC
+            ).isoformat(),
+            "current": attempt["scan_end_at"] is None and active,
+        }
+        for attempt in attempts
+    ]
+    error = cursor.get("reason")
+    if task is not None and task.done() and not task.cancelled():
+        try:
+            task.result()
+        except Exception as task_error:  # noqa: BLE001 - collector reports SDK errors
+            error = f"{type(task_error).__name__}: {task_error}"
+    return web.json_response(
+        {
+            "attempts": attempt_items,
+            "expected_attempts": expected_attempts,
+            "updated_at": cursor.get("updated_at"),
+            "indexing": not cursor.get("complete_from_head") and error is None,
+            "backfill": {
+                "scanned_events": cursor.get("backfill_scanned_events"),
+                "cached_events": cursor.get("backfill_cached_events"),
+                "appended_events": cursor.get("backfill_appended_events"),
+                "total_bytes": cursor.get("total_bytes"),
+            },
+            "error": error,
+        }
+    )
+
+
+async def handle_cached_log_stream(request: web.Request) -> web.StreamResponse:
+    """Stream cached logs immediately while the collector refreshes in the background."""
+    from overwatch.cached_metrics import (
+        cached_cloudwatch_attempts,
+        cached_cloudwatch_log_page,
+    )
+    job_id = int(request.match_info["job_id"])
+    record = resource_record_for_job(request.app, job_id)
+    if record is None:
+        raise web.HTTPNotFound(text="Cached logs are unavailable for this job")
+    if str(record["skypilot"].get("cloud") or "").casefold() != "aws":
+        raise web.HTTPNotFound(text="CloudWatch is unavailable for this job")
+    attempt_number = int(request.query.get("attempt", "0"))
+    if attempt_number:
+        refresh_task = ensure_cached_log_history_task(request.app, job_id)
+    else:
+        refresh_task = ensure_cached_log_refresh_task(request.app, job_id)
+
+    expected_attempts = (record["retries"].get("total_recoveries") or 0) + 1
+    attempts = request.app["log_attempt_cache"].get(str(job_id))
+    if attempts is None:
+        attempts = cached_cloudwatch_attempts(job_id, expected_attempts)
+        request.app["log_attempt_cache"][str(job_id)] = attempts
+    selected_attempt = next(
+        (
+            attempt
+            for attempt in attempts
+            if attempt["attempt"] == attempt_number
+        ),
+        None,
+    )
+    if attempt_number and selected_attempt is None:
+        raise web.HTTPNotFound(text=f"Cached attempt {attempt_number} was not found")
+    attempt_is_live = bool(
+        selected_attempt
+        and selected_attempt["scan_end_at"] is None
+        and record["status"].get("skypilot") in ACTIVE_SKY_STATUSES
+    )
 
     response = web.StreamResponse(
         headers={
@@ -693,140 +530,113 @@ async def handle_log_stream(request: web.Request) -> web.StreamResponse:
         }
     )
     await response.prepare(request)
-    next_token = None
+    pid = None
+    started_after = (
+        selected_attempt["scan_start_at"]
+        if selected_attempt
+        else int((datetime.now(UTC) - timedelta(minutes=2)).timestamp() * 1000)
+    )
+    ended_before = selected_attempt["scan_end_at"] if selected_attempt else None
+    sent_event_ids: set[str] = set()
     try:
+        # Send only a bounded tail page; older history is fetched explicitly by cursor.
+        initial_page = cached_cloudwatch_log_page(
+            job_id,
+            pid=pid,
+            started_after=started_after,
+            ended_before=ended_before,
+        )
+        initial_items = initial_page["events"]
+        payload = json.dumps(initial_page, separators=(",", ":"))
+        await response.write(f"event: tail\ndata: {payload}\n\n".encode())
+        sent_event_ids.update(item["id"] for item in initial_items)
+        if selected_attempt and not attempt_is_live:
+            await response.write(b"event: complete\ndata: {}\n\n")
+            return response
+
+        # Live views never wait on AWS; completed background refreshes expose new local lines.
         while True:
-            request_arguments = {
-                "logGroupName": CLOUDWATCH_LOG_GROUP,
-                "logStreamName": stream_name,
-                "startFromHead": True,
-                "limit": 200,
-            }
-            if next_token is not None:
-                request_arguments["nextToken"] = next_token
-            elif attempt is not None:
-                request_arguments["startTime"] = attempt["scan_start_at"]
-            else:
-                request_arguments["startTime"] = int(
-                    (datetime.now(UTC) - timedelta(minutes=2)).timestamp() * 1000
+            await asyncio.sleep(2)
+            if not refresh_task.done():
+                await response.write(b": cache refresh in progress\n\n")
+                continue
+            try:
+                refresh_task.result()
+            except Exception as refresh_error:  # noqa: BLE001 - SDK errors vary
+                logger.warning(
+                    "Background log refresh failed for job {}: {}",
+                    job_id,
+                    refresh_error,
                 )
-            if attempt is not None and attempt["scan_end_at"] is not None:
-                request_arguments["endTime"] = attempt["scan_end_at"] + 1
-            events = await asyncio.to_thread(
-                cloudwatch_client.get_log_events, **request_arguments
+            page = cached_cloudwatch_log_page(
+                job_id,
+                pid=pid,
+                started_after=started_after,
+                ended_before=ended_before,
             )
-            previous_token = next_token
-            next_token = events["nextForwardToken"]
-            items = []
-            for event in events["events"]:
-                if (
-                    attempt is not None
-                    and cloudwatch_event_pid(event) != attempt["pid"]
-                ):
-                    continue
-                items.append(
-                    {
-                        "timestamp": event["timestamp"],
-                        "html": ansi_log_text_to_safe_html(
-                            cloudwatch_event_message(event)
-                        ),
-                    }
-                )
+            items = [
+                item
+                for item in page["events"]
+                if item["id"] not in sent_event_ids
+            ]
             if items:
-                payload = json.dumps({"events": items}, separators=(",", ":"))
+                sent_event_ids.update(item["id"] for item in items)
+                if len(sent_event_ids) > 5_000:
+                    sent_event_ids = {
+                        item["id"] for item in page["events"]
+                    }
+                payload = json.dumps(
+                    {**page, "events": items}, separators=(",", ":")
+                )
                 await response.write(f"data: {payload}\n\n".encode())
-            if (
-                attempt is not None
-                and not attempt_is_live
-                and next_token == previous_token
-            ):
-                await response.write(b"event: complete\ndata: {}\n\n")
-                break
-            await response.write(b": keepalive\n\n")
-            if (attempt is None or attempt_is_live) and next_token == previous_token:
-                await asyncio.sleep(2)
+            else:
+                await response.write(b": keepalive\n\n")
+            refresh_task = ensure_cached_log_refresh_task(request.app, job_id)
     except (asyncio.CancelledError, ConnectionResetError):
         pass
     return response
 
 
-async def cloudwatch_attempts_for_record(
-    app: web.Application, record: dict[str, Any], stream_name: str
-) -> dict[str, Any]:
-    """Return cached attempt boundaries, refreshing after a new recovery."""
-    job_id = record["skypilot"]["job_id"]
-    expected_attempts = (record["retries"].get("total_recoveries") or 0) + 1
-    cache_key = str(job_id)
-    cached = app["state"]["log_attempts"].get(cache_key)
-    if (
-        cached is not None
-        and cached["stream_name"] == stream_name
-        and cached["expected_attempts"] == expected_attempts
-    ):
-        return cached
-
-    attempts = await asyncio.to_thread(
-        discover_cloudwatch_attempts,
-        app["cloudwatch_client"],
-        stream_name,
-        expected_attempts,
+async def handle_cached_log_page(request: web.Request) -> web.Response:
+    """Return one bounded older page from the raw cache after scheduling collection."""
+    from overwatch.cached_metrics import (
+        cached_cloudwatch_attempts,
+        cached_cloudwatch_log_page,
     )
-    cached = {
-        "stream_name": stream_name,
-        "expected_attempts": expected_attempts,
-        "updated_at": isoformat(datetime.now(UTC)),
-        "attempts": attempts,
-    }
-    app["state"]["log_attempts"][cache_key] = cached
-    persist_report_state(app["state"])
-    return cached
 
-
-async def handle_log_attempts(request: web.Request) -> web.Response:
     job_id = int(request.match_info["job_id"])
-    report = request.app["state"]["report"]
-    record = (
-        next(
-            (
-                item
-                for item in report["resources"]
-                if item["skypilot"]["job_id"] == job_id
-            ),
-            None,
-        )
-        if report
-        else None
+    record = resource_record_for_job(request.app, job_id)
+    if record is None:
+        raise web.HTTPNotFound(text="Cached logs are unavailable for this job")
+    if str(record["skypilot"].get("cloud") or "").casefold() != "aws":
+        raise web.HTTPNotFound(text="CloudWatch is unavailable for this job")
+    ensure_cached_log_history_task(request.app, job_id)
+
+    attempt_number = int(request.query.get("attempt", "0"))
+    expected_attempts = (record["retries"].get("total_recoveries") or 0) + 1
+    attempts = request.app["log_attempt_cache"].get(str(job_id))
+    if attempts is None:
+        attempts = cached_cloudwatch_attempts(job_id, expected_attempts)
+        request.app["log_attempt_cache"][str(job_id)] = attempts
+    selected_attempt = next(
+        (
+            attempt
+            for attempt in attempts
+            if attempt["attempt"] == attempt_number
+        ),
+        None,
     )
-    if record is None or not record["skypilot"].get("cluster_name"):
-        raise web.HTTPNotFound(text="CloudWatch logs are unavailable for this job")
-    stream_name = await asyncio.to_thread(
-        resolve_cloudwatch_stream_name,
-        request.app["cloudwatch_client"],
-        record["skypilot"]["cluster_name"],
-    )
-    if stream_name is None:
-        raise web.HTTPNotFound(text="CloudWatch log stream was not found")
-    cache_entry = await cloudwatch_attempts_for_record(request.app, record, stream_name)
-    attempts = [
-        {
-            "attempt": item["attempt"],
-            "pid": item["pid"],
-            "started_at": datetime.fromtimestamp(
-                item["started_at"] / 1000, UTC
-            ).isoformat(),
-            "current": (
-                item["scan_end_at"] is None
-                and record["status"].get("skypilot") in ACTIVE_SKY_STATUSES
-            ),
-        }
-        for item in cache_entry["attempts"]
-    ]
+    if selected_attempt is None:
+        raise web.HTTPNotFound(text=f"Cached attempt {attempt_number} was not found")
     return web.json_response(
-        {
-            "attempts": attempts,
-            "expected_attempts": cache_entry["expected_attempts"],
-            "updated_at": cache_entry["updated_at"],
-        }
+        cached_cloudwatch_log_page(
+            job_id,
+            started_after=selected_attempt["scan_start_at"],
+            ended_before=selected_attempt["scan_end_at"],
+            before=request.query.get("before"),
+            after=request.query.get("after"),
+            from_start=request.query.get("edge") == "start",
+        )
     )
 
 
@@ -840,7 +650,7 @@ async def update_report_state(
     refresh["in_progress"] = True
     refresh["last_attempt_at"] = isoformat(datetime.now(UTC))
     try:
-        report = await collect_report(
+        report = await collect_report_from_raw_cache(
             args,
             log_progress=log_progress,
             query_diagnostics=state["query_diagnostics"],
@@ -859,10 +669,6 @@ async def update_report_state(
     finally:
         refresh["in_progress"] = False
         refresh["last_duration_seconds"] = round(perf_counter() - refresh_started, 2)
-        try:
-            await asyncio.to_thread(persist_report_state, state)
-        except (OSError, TypeError, ValueError) as error:
-            logger.warning("Could not persist Overwatch state cache: {}", error)
 
 
 async def refresh_report_forever(
@@ -881,11 +687,13 @@ async def refresh_report_forever(
 
 
 async def run_service(args: argparse.Namespace) -> int:
+    from overwatch.collector import CollectorOptions
+
     service_started = perf_counter()
     url = f"http://{args.host}:{args.port}"
+    if uv_env_file := os.environ.get("UV_ENV_FILE"):
+        load_dotenv(uv_env_file)
     await asyncio.to_thread(build_frontend_assets_if_sources_are_newer)
-    cached_state = await asyncio.to_thread(load_persisted_report_state)
-
     refresh_state = {
         "in_progress": False,
         "last_attempt_at": None,
@@ -908,28 +716,37 @@ async def run_service(args: argparse.Namespace) -> int:
         for key, label in QUERY_LABELS.items()
     }
 
-    # Restore only recognized fields so old or partially written state cannot break startup.
-    if cached_state is not None:
-        refresh_state.update(cached_state["refresh"])
-        refresh_state["in_progress"] = False
-        for key, default_diagnostic in query_diagnostics.items():
-            cached_diagnostic = cached_state["query_diagnostics"].get(key)
-            if isinstance(cached_diagnostic, dict):
-                default_diagnostic.update(cached_diagnostic)
-
     app = web.Application()
+    app["collector_options"] = CollectorOptions(
+        limit=args.limit,
+        entity=args.entity,
+        gcp_billing_table=(
+            getattr(args, "gcp_billing_table", None)
+            or os.environ.get("GCP_BILLING_EXPORT_TABLE")
+        ),
+    )
     app["state"] = {
         "startup_id": uuid.uuid4().hex,
-        "report": cached_state["report"] if cached_state is not None else None,
-        "report_error": (
-            cached_state["report_error"] if cached_state is not None else None
-        ),
+        "report": None,
+        "report_error": None,
         "refresh": refresh_state,
         "query_diagnostics": query_diagnostics,
-        "log_attempts": (
-            cached_state.get("log_attempts", {}) if cached_state is not None else {}
-        ),
     }
+    app["log_attempt_tasks"] = {}
+    app["log_attempt_cache"] = {}
+    app["log_refresh_tasks"] = {}
+    from overwatch.collector import raw_cache_path
+
+    # Build the first screen immediately from raw files before refreshing providers.
+    if raw_cache_path("global", "sky", "jobs.json").exists():
+        try:
+            app["state"]["report"] = await collect_report_from_raw_cache(
+                args,
+                query_diagnostics=query_diagnostics,
+                refresh_cache=False,
+            )
+        except (OSError, TypeError, ValueError) as error:
+            logger.warning("Could not render the existing raw metric cache: {}", error)
     if app["state"]["report"] is not None:
         logger.info(
             "Restored {} cached resources; refreshing in the background.",
@@ -938,14 +755,18 @@ async def run_service(args: argparse.Namespace) -> int:
     app.add_routes(
         [
             web.get("/", handle_index),
+            web.get("/runs/{job_id:\\d+}", handle_index),
             web.get("/billing", handle_index),
             web.get("/cost-waste", handle_index),
             web.get("/api/report", handle_report_json),
             web.get("/api/health", handle_health),
             web.get("/api/status", handle_query_status),
             web.get("/api/status/{query_key}/raw", handle_raw_query_output),
-            web.get("/api/logs/{job_id:\\d+}/attempts", handle_log_attempts),
-            web.get("/api/logs/{job_id:\\d+}", handle_log_stream),
+            web.get(
+                "/api/logs/{job_id:\\d+}/attempts", handle_cached_log_attempts
+            ),
+            web.get("/api/logs/{job_id:\\d+}/page", handle_cached_log_page),
+            web.get("/api/logs/{job_id:\\d+}", handle_cached_log_stream),
             web.static("/static", Path(files("overwatch").joinpath("static"))),
         ]
     )
@@ -974,7 +795,6 @@ async def run_service(args: argparse.Namespace) -> int:
 
     background_tasks = []
     try:
-        app["cloudwatch_client"] = boto3.client("logs", region_name=CLOUDWATCH_REGION)
         try:
             report = await update_report_state(app, args, log_progress=True)
             logger.success(

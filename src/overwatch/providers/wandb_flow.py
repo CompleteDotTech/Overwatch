@@ -118,11 +118,19 @@ def normalized_wandb_experiment_name(run: Any) -> str:
 def match_skypilot_job(
     run: Any, jobs: list[Any], excluded_job_ids: set[int]
 ) -> Any | None:
+    run_name = (run.name or "").split("/", 1)[-1]
     experiment_name = normalized_wandb_experiment_name(run)
-    candidates = [
+    exact_name_candidates = [
         job
         for job in jobs
-        if job.job_name == experiment_name and job.job_id not in excluded_job_ids
+        if job.job_name == run_name and job.job_id not in excluded_job_ids
+    ]
+    # Haiku suffixes can change across resumed jobs; normalize both sides only as a fallback.
+    candidates = exact_name_candidates or [
+        job
+        for job in jobs
+        if HAIKU_SUFFIX_RE.sub("", job.job_name or "") == experiment_name
+        and job.job_id not in excluded_job_ids
     ]
     if not candidates:
         return None

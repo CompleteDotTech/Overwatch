@@ -14,7 +14,9 @@ import {
   Drawer,
   Group,
   Loader,
+  List,
   Modal,
+  Popover,
   Progress,
   ScrollArea,
   Select,
@@ -22,6 +24,7 @@ import {
   Stack,
   Table,
   Text,
+  TextInput,
   ThemeIcon,
   Title,
   Tooltip,
@@ -31,18 +34,42 @@ import {
 import {
   IconAlertTriangle,
   IconActivityHeartbeat,
+  IconArrowBarToDown,
+  IconArrowBarToUp,
+  IconArrowLeft,
   IconChartLine,
   IconCheck,
   IconCode,
+  IconCopy,
   IconCurrencyDollar,
   IconDatabase,
   IconFileText,
+  IconHelpCircle,
+  IconSearch,
   IconServer,
   IconTerminal2,
 } from "@tabler/icons-react";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 
 import type { ConfigDifference, LogAttempt, QueryStatusReport, Report, Resource } from "./types";
+
+interface CloudWatchLogEvent {
+  id: string;
+  timestamp: number;
+  html: string;
+}
+
+interface CloudWatchLogPage {
+  events: CloudWatchLogEvent[];
+  has_older: boolean;
+  has_newer: boolean;
+  oldest_cursor: string | null;
+  newest_cursor: string | null;
+}
+
+const MAX_LOG_EVENTS = 2_000;
+const INITIAL_LOG_ITEM_INDEX = 1_000_000;
 
 const ACTIVE_STATUSES = new Set([
   "PENDING",
@@ -121,7 +148,7 @@ function Warnings({ warnings }: { warnings: string[] }) {
   );
 }
 
-type Page = "resources" | "billing" | "cost-waste";
+type Page = "resources" | "billing" | "cost-waste" | "run";
 
 function Navigation({
   page,
@@ -156,7 +183,7 @@ function Navigation({
           <Button
             component="a"
             href="/"
-            variant={page === "resources" ? "light" : "subtle"}
+            variant={page === "resources" || page === "run" ? "light" : "subtle"}
             leftSection={<IconServer size={16} />}
           >
             Resources
@@ -330,7 +357,7 @@ function SortHeader({
   );
 }
 
-function ResourceLinks({ resource, onLogs }: { resource: Resource; onLogs?: () => void }) {
+function ResourceLinks({ resource }: { resource: Resource }) {
   const links = [
     {
       label: "W&B",
@@ -397,28 +424,50 @@ function ResourceLinks({ resource, onLogs }: { resource: Resource; onLogs?: () =
           )}
         </CopyButton>
       )}
-      {onLogs && resource.skypilot.job_id != null && resource.skypilot.cluster_name && (
-        <Tooltip label="Live logs">
-          <ActionIcon aria-label="Live logs" color="green" variant="subtle" onClick={onLogs}>
-            <IconTerminal2 size={16} />
-          </ActionIcon>
-        </Tooltip>
-      )}
     </Group>
+  );
+}
+
+function ResourceNameLink({ resource }: { resource: Resource }) {
+  return resource.skypilot.job_id != null ? (
+    <Anchor fw={600} href={`/runs/${resource.skypilot.job_id}`}>
+      {resource.name}
+    </Anchor>
+  ) : (
+    <Text fw={600}>{resource.name}</Text>
   );
 }
 
 function ResourcesTable({ resources }: { resources: Resource[] }) {
   const [sortKey, setSortKey] = useState<SortKey>("started");
   const [descending, setDescending] = useState(true);
-  const [logResource, setLogResource] = useState<Resource | null>(null);
-  const [logHtml, setLogHtml] = useState("");
-  const [logAttempts, setLogAttempts] = useState<LogAttempt[]>([]);
-  const [expectedLogAttempts, setExpectedLogAttempts] = useState(0);
-  const [selectedLogAttempt, setSelectedLogAttempt] = useState<string | null>(null);
+  const [searchQuery, setSearchQuery] = useState("");
 
   const sortedResources = useMemo(() => {
-    return [...resources].sort((left, right) => {
+    const normalizedQuery = searchQuery.trim().toLocaleLowerCase();
+    const matchingResources = normalizedQuery
+      ? resources.filter((resource) =>
+          [
+            resource.name,
+            resource.user,
+            resource.project,
+            resource.wandb_id,
+            resource.kind,
+            resource.status.skypilot,
+            resource.status.wandb,
+            resource.skypilot.job_id,
+            resource.skypilot.job_name,
+            resource.skypilot.cluster_name,
+            resource.skypilot.resources,
+            resource.skypilot.cloud,
+            resource.skypilot.region,
+          ]
+            .filter((value) => value != null)
+            .some((value) => String(value).toLocaleLowerCase().includes(normalizedQuery)),
+        )
+      : resources;
+
+    return [...matchingResources].sort((left, right) => {
       const leftStatus = left.status.skypilot ?? "";
       const rightStatus = right.status.skypilot ?? "";
       const leftPriority =
@@ -445,58 +494,8 @@ function ResourcesTable({ resources }: { resources: Resource[] }) {
           : String(leftValue).localeCompare(String(rightValue), undefined, { numeric: true });
       return descending ? -comparison : comparison;
     });
-  }, [descending, resources, sortKey]);
+  }, [descending, resources, searchQuery, sortKey]);
 
-  useEffect(() => {
-    if (!logResource?.skypilot.job_id) return;
-    const controller = new AbortController();
-    setLogAttempts([]);
-    setSelectedLogAttempt(null);
-    setLogHtml("Finding CloudWatch attempts…\n");
-    fetch(`/api/logs/${logResource.skypilot.job_id}/attempts`, { signal: controller.signal })
-      .then(async (response) => {
-        if (!response.ok) throw new Error(await response.text());
-        return response.json() as Promise<{ attempts: LogAttempt[]; expected_attempts: number }>;
-      })
-      .then(({ attempts, expected_attempts }) => {
-        setLogAttempts(attempts);
-        setExpectedLogAttempts(expected_attempts);
-        setSelectedLogAttempt(attempts.at(-1)?.attempt.toString() ?? null);
-        if (!attempts.length) setLogHtml("No CloudWatch workload attempts were found.\n");
-      })
-      .catch((error: Error) => {
-        if (error.name !== "AbortError") setLogHtml(`CloudWatch attempt lookup failed: ${error.message}\n`);
-      });
-    return () => controller.abort();
-  }, [logResource]);
-
-  useEffect(() => {
-    if (!logResource?.skypilot.job_id || !selectedLogAttempt) return;
-    setLogHtml("Connecting to CloudWatch…\n");
-    const events = new EventSource(
-      `/api/logs/${logResource.skypilot.job_id}?attempt=${selectedLogAttempt}`,
-    );
-    events.onmessage = (event) => {
-      const payload = JSON.parse(event.data) as {
-        events: Array<{ timestamp: number; html: string }>;
-      };
-      const lines = payload.events
-        .map((item) => `[${new Date(item.timestamp).toLocaleTimeString()}] ${item.html}`)
-        .join("\n");
-      setLogHtml((current) =>
-        `${current.startsWith("Connecting") ? "" : current}${lines}\n`,
-      );
-    };
-    events.onerror = () =>
-      setLogHtml((current) =>
-        current.endsWith("Reconnecting…\n") ? current : `${current}\nReconnecting…\n`,
-      );
-    events.addEventListener("complete", () => {
-      events.close();
-      setLogHtml((current) => `${current}\n— End of attempt —\n`);
-    });
-    return () => events.close();
-  }, [logResource, selectedLogAttempt]);
 
   const onSort = (value: SortKey) => {
     if (sortKey === value) setDescending((current) => !current);
@@ -509,6 +508,21 @@ function ResourcesTable({ resources }: { resources: Resource[] }) {
   return (
     <>
       <Card withBorder padding={0}>
+        {resources.length > 1 && <Box p="md">
+          <TextInput
+            aria-label="Search resources"
+            placeholder="Search resources by name, user, project, status, cloud, region, or job ID…"
+            leftSection={<IconSearch size={17} />}
+            rightSection={
+              <Text size="xs" c="dimmed">
+                {sortedResources.length}/{resources.length}
+              </Text>
+            }
+            rightSectionWidth={64}
+            value={searchQuery}
+            onChange={(event) => setSearchQuery(event.currentTarget.value)}
+          />
+        </Box>}
         <Table.ScrollContainer minWidth={1320}>
           <Table striped highlightOnHover verticalSpacing="sm">
             <Table.Thead>
@@ -522,18 +536,30 @@ function ResourcesTable({ resources }: { resources: Resource[] }) {
                 </Table.Th>
                 <SortHeader label="Started" secondaryLabel="elapsed > time left" value="started" active={sortKey === "started"} descending={descending} onSort={onSort} />
                 <SortHeader label="Cost" secondaryLabel="spent / projected · $/hr" value="cost" active={sortKey === "cost"} descending={descending} onSort={onSort} />
-                <SortHeader label="Cloud / region" value="cloud" active={sortKey === "cloud"} descending={descending} onSort={onSort} />
+                <SortHeader label="Cloud / region" secondaryLabel="instance resources" value="cloud" active={sortKey === "cloud"} descending={descending} onSort={onSort} />
                 <Table.Th>Links</Table.Th>
               </Table.Tr>
             </Table.Thead>
             <Table.Tbody>
+              {sortedResources.length === 0 && (
+                <Table.Tr>
+                  <Table.Td colSpan={8}>
+                    <Center py="xl">
+                      <Text c="dimmed">No resources match “{searchQuery.trim()}”.</Text>
+                    </Center>
+                  </Table.Td>
+                </Table.Tr>
+              )}
               {sortedResources.map((resource) => {
                 const progress = Math.max(0, Math.min(100, (resource.progress.progress_fraction ?? 0) * 100));
                 return (
                   <Table.Tr key={`${resource.kind}-${resource.skypilot.job_id ?? resource.name}`}>
                     <Table.Td miw={280}>
-                      <Text size="xs" c="dimmed">{resource.user ?? "—"} / {resource.project ?? "—"}</Text>
-                      <Text fw={600}>{resource.name}</Text>
+                      <Text size="xs" c="dimmed">
+                        {resource.user ?? "—"} / {resource.project ?? "—"}
+                        {resource.skypilot.job_id != null && ` · Sky job ${resource.skypilot.job_id}`}
+                      </Text>
+                      <ResourceNameLink resource={resource} />
                     </Table.Td>
                     <Table.Td>
                       <Stack gap={4} align="flex-start">
@@ -563,8 +589,12 @@ function ResourcesTable({ resources }: { resources: Resource[] }) {
                       <Text>{formatMoney(resource.cost.estimated_spend_usd)} / {formatMoney(resource.cost.estimated_total_usd)}</Text>
                       <Text size="xs" c="dimmed">{formatMoney(resource.cost.hourly_usd)}/hr</Text>
                     </Table.Td>
-                    <Table.Td>{resource.skypilot.cloud ?? "—"}<Text size="xs" c="dimmed">{resource.skypilot.region ?? "—"}</Text></Table.Td>
-                    <Table.Td><ResourceLinks resource={resource} onLogs={() => setLogResource(resource)} /></Table.Td>
+                    <Table.Td miw={150}>
+                      <Text>{resource.skypilot.cloud ?? "—"}</Text>
+                      <Text size="xs" c="dimmed">{resource.skypilot.region ?? "—"}</Text>
+                      <Text size="xs" ff="monospace" mt={3}>{resource.skypilot.resources ?? "—"}</Text>
+                    </Table.Td>
+                    <Table.Td><ResourceLinks resource={resource} /></Table.Td>
                   </Table.Tr>
                 );
               })}
@@ -572,36 +602,407 @@ function ResourcesTable({ resources }: { resources: Resource[] }) {
           </Table>
         </Table.ScrollContainer>
       </Card>
-      <Drawer
-        opened={logResource != null}
-        onClose={() => setLogResource(null)}
-        title={`Live logs · ${logResource?.name ?? ""}`}
-        position="bottom"
-        size="100%"
-      >
-        <Group mb="sm" justify="space-between">
+    </>
+  );
+}
+
+function CloudWatchAttemptHelp() {
+  return (
+    <Popover width={430} position="bottom-start" shadow="md">
+      <Popover.Target>
+        <ActionIcon variant="subtle" color="gray" aria-label="How CloudWatch attempts are detected">
+          <IconHelpCircle size={19} />
+        </ActionIcon>
+      </Popover.Target>
+      <Popover.Dropdown>
+        <Text fw={700} mb="xs">How CloudWatch attempts are detected</Text>
+        <List type="ordered" spacing="xs" size="sm">
+          <List.Item>Read locally cached events in timestamp order.</List.Item>
+          <List.Item>Extract <Code>pid</Code> from structured messages or plain-text <Code>pid=…</Code> markers.</List.Item>
+          <List.Item>Order unique PIDs by first event; each PID establishes one attempt window.</List.Item>
+          <List.Item>Show every cached event in that window, including untagged setup and teardown lines.</List.Item>
+        </List>
+        <Alert color="yellow" variant="light" mt="md" icon={<IconAlertTriangle size={17} />}>
+          An auxiliary process with its own PID may be mistaken for a recovery attempt.
+        </Alert>
+      </Popover.Dropdown>
+    </Popover>
+  );
+}
+
+function CloudWatchLogsView({ resource }: { resource: Resource }) {
+  const jobId = resource.skypilot.job_id;
+  const [logEvents, setLogEvents] = useState<CloudWatchLogEvent[]>([]);
+  const [logStatus, setLogStatus] = useState("Loading cached logs…");
+  const [logAttempts, setLogAttempts] = useState<LogAttempt[]>([]);
+  const [expectedLogAttempts, setExpectedLogAttempts] = useState(0);
+  const [logAttemptsIndexing, setLogAttemptsIndexing] = useState(false);
+  const [logBackfillCachedEvents, setLogBackfillCachedEvents] = useState<number | null>(null);
+  const [logAttemptError, setLogAttemptError] = useState<string | null>(null);
+  const [selectedLogAttempt, setSelectedLogAttempt] = useState<string | null>(null);
+  const [logHasOlder, setLogHasOlder] = useState(false);
+  const [logHasNewer, setLogHasNewer] = useState(false);
+  const [logLoadingDirection, setLogLoadingDirection] = useState<"older" | "newer" | "start" | "end" | null>(null);
+  const [browsingOlderLogs, setBrowsingOlderLogs] = useState(false);
+  const [logReloadKey, setLogReloadKey] = useState(0);
+  const [firstLogItemIndex, setFirstLogItemIndex] = useState(INITIAL_LOG_ITEM_INDEX);
+  const logPagingRef = useRef(false);
+  const logViewerRef = useRef<VirtuosoHandle>(null);
+  const pendingLogEndJumpRef = useRef(false);
+
+  useEffect(() => {
+    if (
+      jobId == null ||
+      resource.skypilot.cloud?.toLowerCase() !== "aws" ||
+      !resource.skypilot.cluster_name
+    ) return;
+    const controller = new AbortController();
+    let pollTimer: number | undefined;
+    setLogAttemptsIndexing(true);
+
+    // Poll cached attempt metadata while the collector backfills history independently.
+    const loadAttempts = () => {
+      fetch(`/api/logs/${jobId}/attempts`, { signal: controller.signal })
+        .then(async (response) => {
+          if (!response.ok) throw new Error(await response.text());
+          return response.json() as Promise<{
+            attempts: LogAttempt[];
+            expected_attempts: number;
+            indexing: boolean;
+            backfill: { cached_events: number | null };
+            error: string | null;
+          }>;
+        })
+        .then(({ attempts, expected_attempts, indexing, backfill, error }) => {
+          setLogAttempts(attempts);
+          setExpectedLogAttempts(expected_attempts);
+          setLogAttemptsIndexing(indexing);
+          setLogBackfillCachedEvents(backfill.cached_events);
+          setLogAttemptError(error);
+          if (error) setLogStatus(error);
+          const newestAttempt = attempts.find((attempt) => attempt.current) ?? attempts.at(-1);
+          if (newestAttempt) {
+            setSelectedLogAttempt((selected) =>
+              selected == null || selected === "live" ? newestAttempt.attempt.toString() : selected,
+            );
+          } else {
+            setSelectedLogAttempt((selected) => selected ?? "live");
+          }
+          if (indexing) pollTimer = window.setTimeout(loadAttempts, 5_000);
+        })
+        .catch((error: Error) => {
+          if (error.name !== "AbortError") {
+            setLogAttemptsIndexing(false);
+            setLogAttemptError(error.message);
+          }
+        });
+    };
+    loadAttempts();
+    return () => {
+      controller.abort();
+      if (pollTimer != null) window.clearTimeout(pollTimer);
+    };
+  }, [jobId, resource.skypilot.cloud, resource.skypilot.cluster_name]);
+
+  useEffect(() => {
+    if (
+      jobId == null ||
+      resource.skypilot.cloud?.toLowerCase() !== "aws" ||
+      !resource.skypilot.cluster_name ||
+      !selectedLogAttempt ||
+      browsingOlderLogs
+    ) return;
+    setLogEvents([]);
+    setLogHasOlder(false);
+    setLogHasNewer(false);
+    setFirstLogItemIndex(INITIAL_LOG_ITEM_INDEX);
+    setLogStatus("Loading cached logs…");
+    const logUrl =
+      selectedLogAttempt === "live"
+        ? `/api/logs/${jobId}`
+        : `/api/logs/${jobId}?attempt=${selectedLogAttempt}`;
+    const eventSource = new EventSource(logUrl);
+    const mergeLogBatch = (event: MessageEvent<string>, replace = false) => {
+      const payload = JSON.parse(event.data) as CloudWatchLogPage;
+      setLogEvents((current) => {
+        const byId = new Map((replace ? [] : current).map((item) => [item.id, item]));
+        for (const item of payload.events) byId.set(item.id, item);
+        return [...byId.values()].sort(
+          (left, right) => left.timestamp - right.timestamp || left.id.localeCompare(right.id),
+        ).slice(-MAX_LOG_EVENTS);
+      });
+      setLogHasOlder(payload.has_older);
+      setLogHasNewer(payload.has_newer);
+      setLogStatus("");
+      if (replace && pendingLogEndJumpRef.current) {
+        pendingLogEndJumpRef.current = false;
+        logPagingRef.current = false;
+        setLogLoadingDirection(null);
+        window.requestAnimationFrame(() =>
+          logViewerRef.current?.scrollToIndex({
+            index: INITIAL_LOG_ITEM_INDEX + payload.events.length - 1,
+            align: "end",
+          }),
+        );
+      }
+    };
+    eventSource.onmessage = mergeLogBatch;
+    eventSource.addEventListener("tail", (event) =>
+      mergeLogBatch(event as MessageEvent<string>, true),
+    );
+    eventSource.onerror = () => {
+      pendingLogEndJumpRef.current = false;
+      logPagingRef.current = false;
+      setLogLoadingDirection(null);
+      setLogStatus("Waiting for cached log updates…");
+    };
+    eventSource.addEventListener("complete", () => {
+      eventSource.close();
+      setLogStatus("— End of attempt —");
+    });
+    return () => eventSource.close();
+  }, [jobId, resource.skypilot.cloud, resource.skypilot.cluster_name, selectedLogAttempt, browsingOlderLogs, logReloadKey]);
+
+  const loadLogPage = async (direction: "older" | "newer") => {
+    const boundaryEvent = direction === "older" ? logEvents[0] : logEvents.at(-1);
+    if (
+      logPagingRef.current ||
+      jobId == null ||
+      !selectedLogAttempt ||
+      selectedLogAttempt === "live" ||
+      !boundaryEvent ||
+      (direction === "older" ? !logHasOlder : !logHasNewer)
+    ) return;
+    logPagingRef.current = true;
+    setLogLoadingDirection(direction);
+    if (direction === "older") setBrowsingOlderLogs(true);
+    try {
+      const query = new URLSearchParams({
+        attempt: selectedLogAttempt,
+        [direction === "older" ? "before" : "after"]: `${boundaryEvent.timestamp}:${boundaryEvent.id}`,
+      });
+      const response = await fetch(`/api/logs/${jobId}/page?${query}`);
+      if (!response.ok) throw new Error(await response.text());
+      const page = await response.json() as CloudWatchLogPage;
+      const byId = new Map(logEvents.map((item) => [item.id, item]));
+      for (const item of page.events) byId.set(item.id, item);
+      const merged = [...byId.values()].sort(
+        (left, right) => left.timestamp - right.timestamp || left.id.localeCompare(right.id),
+      );
+      const retained = direction === "older"
+        ? merged.slice(0, MAX_LOG_EVENTS)
+        : merged.slice(-MAX_LOG_EVENTS);
+      const oldFirstId = logEvents[0]?.id;
+      const oldFirstPosition = oldFirstId == null
+        ? -1
+        : retained.findIndex((item) => item.id === oldFirstId);
+      if (direction === "older" && oldFirstPosition > 0) {
+        setFirstLogItemIndex((index) => index - oldFirstPosition);
+      } else if (direction === "newer") {
+        const retainedIds = new Set(retained.map((item) => item.id));
+        const removedFromStart = logEvents.findIndex((item) => retainedIds.has(item.id));
+        if (removedFromStart > 0) {
+          setFirstLogItemIndex((index) => index + removedFromStart);
+        }
+      }
+      setLogEvents(retained);
+      setLogHasOlder(page.has_older);
+      setLogHasNewer(page.has_newer);
+      setLogStatus(
+        page.events.length
+          ? ""
+          : direction === "older"
+            ? "— Start of attempt —"
+            : "— End of attempt —",
+      );
+      if (direction === "newer" && !page.has_newer) {
+        setBrowsingOlderLogs(false);
+        setLogReloadKey((key) => key + 1);
+      }
+    } catch (error) {
+      setLogStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      logPagingRef.current = false;
+      setLogLoadingDirection(null);
+    }
+  };
+
+  const jumpToLogEdge = async (edge: "start" | "end") => {
+    if (
+      logPagingRef.current ||
+      jobId == null ||
+      !selectedLogAttempt ||
+      selectedLogAttempt === "live"
+    ) return;
+    logPagingRef.current = true;
+    setLogLoadingDirection(edge);
+    setLogStatus(`Loading ${edge} of attempt…`);
+    if (edge === "end") {
+      pendingLogEndJumpRef.current = true;
+      setBrowsingOlderLogs(false);
+      setLogReloadKey((key) => key + 1);
+      return;
+    }
+    setBrowsingOlderLogs(true);
+    try {
+      const query = new URLSearchParams({
+        attempt: selectedLogAttempt,
+        edge: "start",
+      });
+      const response = await fetch(`/api/logs/${jobId}/page?${query}`);
+      if (!response.ok) throw new Error(await response.text());
+      const page = await response.json() as CloudWatchLogPage;
+      setLogEvents(page.events);
+      setLogHasOlder(page.has_older);
+      setLogHasNewer(page.has_newer);
+      setFirstLogItemIndex(INITIAL_LOG_ITEM_INDEX);
+      setLogStatus(page.events.length ? "" : "— Start of attempt —");
+      window.requestAnimationFrame(() =>
+        logViewerRef.current?.scrollToIndex({
+          index: INITIAL_LOG_ITEM_INDEX,
+          align: "start",
+        }),
+      );
+    } catch (error) {
+      setLogStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      logPagingRef.current = false;
+      setLogLoadingDirection(null);
+    }
+  };
+
+  if (jobId == null || resource.skypilot.cloud?.toLowerCase() !== "aws") {
+    return (
+      <Alert color="gray" icon={<IconTerminal2 size={18} />}>
+        CloudWatch logs are unavailable for this run.
+      </Alert>
+    );
+  }
+  if (!resource.skypilot.cluster_name) {
+    return (
+      <Card withBorder padding="lg">
+        <Group gap="xs" mb="sm">
+          <IconTerminal2 size={20} />
+          <Title order={2}>CloudWatch logs</Title>
+          <CloudWatchAttemptHelp />
+        </Group>
+        <Alert color="yellow" icon={<IconAlertTriangle size={18} />}>
+          Logs are not populated yet. SkyPilot reports this job as <Code>{resource.status.skypilot ?? "unknown"}</Code> and has not published its AWS cluster link. The collector will retry during refreshes.
+        </Alert>
+      </Card>
+    );
+  }
+  return (
+    <Card withBorder padding="lg">
+      <Group mb="md" justify="space-between" align="flex-end">
+        <Box>
+          <Group gap="xs">
+            <IconTerminal2 size={20} />
+            <Title order={2}>CloudWatch logs</Title>
+            <CloudWatchAttemptHelp />
+          </Group>
+          <Text c="dimmed" size="sm">Served from the local raw cache</Text>
+        </Box>
+        <Group gap="xs" align="flex-end">
           <Select
-            label="CloudWatch attempt"
+            label="Attempt"
             placeholder="Finding attempts…"
             value={selectedLogAttempt}
-            onChange={setSelectedLogAttempt}
-            data={logAttempts.map((attempt) => ({
-              value: attempt.attempt.toString(),
-              label: `Attempt ${attempt.attempt}${attempt.current ? " · current" : ""} · PID ${attempt.pid}`,
-            }))}
+            onChange={(attempt) => {
+              setBrowsingOlderLogs(false);
+              setFirstLogItemIndex(INITIAL_LOG_ITEM_INDEX);
+              setSelectedLogAttempt(attempt);
+            }}
+            data={[
+              ...(logAttempts.length === 0
+                ? [{ value: "live", label: "Latest cached logs" }]
+                : []),
+              ...logAttempts.map((attempt) => ({
+                value: attempt.attempt.toString(),
+                label: `Attempt ${attempt.attempt}${attempt.current ? " · current/live" : ""} · PID ${attempt.pid}`,
+              })),
+            ]}
             w={360}
           />
-          <Badge color={logAttempts.length === expectedLogAttempts ? "green" : "yellow"} variant="light">
-            {logAttempts.length}/{expectedLogAttempts || "?"} attempts with CloudWatch logs
-          </Badge>
+          {logAttemptsIndexing && <Loader size="xs" mb="sm" />}
+          <Tooltip label={logAttemptError ?? undefined} disabled={!logAttemptError}>
+            <Badge
+              mb="sm"
+              color={logAttemptError ? "red" : logAttemptsIndexing ? "blue" : logAttempts.length === expectedLogAttempts ? "green" : "yellow"}
+              variant="light"
+            >
+              {logAttemptsIndexing
+                ? `Backfilling${logBackfillCachedEvents != null ? ` · ${logBackfillCachedEvents.toLocaleString()} events` : ""} · `
+                : ""}
+              {logAttempts.length}/{expectedLogAttempts || "?"} attempts
+            </Badge>
+          </Tooltip>
         </Group>
-        <ScrollArea h="calc(100vh - 180px)" type="auto">
-          <Code block bg="dark.9" c="green.2" p="md">
-            <span dangerouslySetInnerHTML={{ __html: logHtml }} />
-          </Code>
-        </ScrollArea>
-      </Drawer>
-    </>
+      </Group>
+      <Group justify="space-between" mb="xs">
+        <Group gap="xs">
+          <Tooltip label="Jump to start of attempt">
+            <ActionIcon
+              aria-label="Jump to start of attempt"
+              variant="light"
+              loading={logLoadingDirection === "start"}
+              disabled={!selectedLogAttempt || selectedLogAttempt === "live"}
+              onClick={() => void jumpToLogEdge("start")}
+            >
+              <IconArrowBarToUp size={17} />
+            </ActionIcon>
+          </Tooltip>
+          <Tooltip label="Jump to end of attempt">
+            <ActionIcon
+              aria-label="Jump to end of attempt"
+              variant="light"
+              loading={logLoadingDirection === "end"}
+              disabled={!selectedLogAttempt || selectedLogAttempt === "live"}
+              onClick={() => void jumpToLogEdge("end")}
+            >
+              <IconArrowBarToDown size={17} />
+            </ActionIcon>
+          </Tooltip>
+          <Text size="xs" c="dimmed">
+            {logLoadingDirection
+              ? `Loading ${logLoadingDirection} cached events…`
+              : "Scroll to the top or bottom to load more"}
+          </Text>
+        </Group>
+        <Text size="xs" c="dimmed">
+          {logEvents.length.toLocaleString()} events in memory · maximum {MAX_LOG_EVENTS.toLocaleString()}
+        </Text>
+      </Group>
+      <Box bg="dark.9" style={{ height: 620, overflow: "hidden" }}>
+        <Virtuoso
+          ref={logViewerRef}
+          data={logEvents}
+          firstItemIndex={firstLogItemIndex}
+          followOutput={browsingOlderLogs ? false : "auto"}
+          startReached={() => void loadLogPage("older")}
+          endReached={() => void loadLogPage("newer")}
+          computeItemKey={(_index, item) => item.id}
+          itemContent={(_index, item) => (
+            <Box
+              px="md"
+              py={2}
+              c="green.2"
+              ff="monospace"
+              fz="xs"
+              style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}
+            >
+              <span>[{new Date(item.timestamp).toLocaleTimeString()}] </span>
+              <span dangerouslySetInnerHTML={{ __html: item.html }} />
+            </Box>
+          )}
+          components={{
+            Footer: () => logStatus ? (
+              <Text c="dimmed" ff="monospace" fz="xs" p="md">{logStatus}</Text>
+            ) : null,
+          }}
+        />
+      </Box>
+    </Card>
   );
 }
 
@@ -673,6 +1074,99 @@ function ResourcesPage({ report }: { report: Report }) {
         <Title order={2} mb="md">Running Job TrainConfig Deltas</Title>
         <ConfigDifferences projects={report.config_differences} />
       </Box>
+    </Stack>
+  );
+}
+
+function RunPage({ report, jobId }: { report: Report; jobId: number }) {
+  const resource = report.resources.find((item) => item.skypilot.job_id === jobId);
+  if (!resource) {
+    return (
+      <Alert color="yellow" icon={<IconAlertTriangle size={18} />}>
+        Job {jobId} is not present in the retained SkyPilot cache.
+      </Alert>
+    );
+  }
+  return (
+    <Stack gap="xl">
+      <Box>
+        <Button
+          component="a"
+          href="/"
+          variant="subtle"
+          leftSection={<IconArrowLeft size={16} />}
+          mb="sm"
+        >
+          All resources
+        </Button>
+        <Group justify="space-between" align="flex-start">
+          <Box>
+            <Title order={1}>{resource.name}</Title>
+            <Text c="dimmed">
+              SkyPilot job {jobId} · {resource.user ?? "Unknown user"} · {resource.project ?? "No W&B project"}
+            </Text>
+          </Box>
+          <Group gap="xs">
+            {resource.status.wandb && (
+              <Badge color={statusColor(resource.status.wandb)} size="lg" variant="light">
+                W&B · {resource.status.wandb}
+              </Badge>
+            )}
+            <Badge color={statusColor(resource.status.skypilot)} size="lg" variant="light">
+              Sky · {resource.status.skypilot ?? "unknown"}
+            </Badge>
+          </Group>
+        </Group>
+      </Box>
+
+      <Card withBorder padding={0}>
+        <Table verticalSpacing="sm">
+          <Table.Tbody>
+            {[
+              {
+                label: "Raw cache directory",
+                value: `${report.raw_cache_root ?? "~/.cache/overwatch/raw-v1"}/jobs/${jobId}`,
+              },
+              ...(resource.storage.run_uri
+                ? [{ label: "TrainConfig run_dir", value: resource.storage.run_uri }]
+                : []),
+            ].map(({ label, value }) => (
+              <Table.Tr key={label}>
+                <Table.Td w={180} c="dimmed" fz="sm">{label}</Table.Td>
+                <Table.Td>
+                  <Code style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>
+                    {value}
+                  </Code>
+                </Table.Td>
+                <Table.Td w={48}>
+                  <CopyButton value={value}>
+                    {({ copied, copy }) => (
+                      <Tooltip label={copied ? "Copied" : `Copy ${label}`}>
+                        <ActionIcon
+                          aria-label={`Copy ${label}`}
+                          color={copied ? "green" : "gray"}
+                          variant="subtle"
+                          onClick={copy}
+                        >
+                          {copied ? <IconCheck size={16} /> : <IconCopy size={16} />}
+                        </ActionIcon>
+                      </Tooltip>
+                    )}
+                  </CopyButton>
+                </Table.Td>
+              </Table.Tr>
+            ))}
+          </Table.Tbody>
+        </Table>
+      </Card>
+
+      <Box>
+        <Title order={2} mb="md">Run telemetry</Title>
+        <ResourcesTable resources={[resource]} />
+      </Box>
+
+      <CloudWatchLogsView resource={resource} />
+
     </Stack>
   );
 }
@@ -805,7 +1299,7 @@ function CostWastePage({ report }: { report: Report }) {
                 {wasteCandidates.map(({ resource, reasons }) => (
                   <Table.Tr key={`${resource.kind}-${resource.skypilot.job_id ?? resource.name}`}>
                     <Table.Td>
-                      <Text fw={600}>{resource.name}</Text>
+                      <ResourceNameLink resource={resource} />
                       <Text c="dimmed" size="xs">{resource.user ?? "Unknown user"}</Text>
                     </Table.Td>
                     <Table.Td>
@@ -853,7 +1347,7 @@ function CostWastePage({ report }: { report: Report }) {
               <Table.Tbody>
                 {recoveries.map((resource) => (
                   <Table.Tr key={`${resource.kind}-${resource.skypilot.job_id ?? resource.name}`}>
-                    <Table.Td><Text fw={600}>{resource.name}</Text></Table.Td>
+                    <Table.Td><ResourceNameLink resource={resource} /></Table.Td>
                     <Table.Td>{formatTimestamp(resource.timing.started_at)}</Table.Td>
                     <Table.Td>{resource.retries.total_recoveries ?? "—"}</Table.Td>
                     <Table.Td>{resource.retries.preemption_or_infrastructure ?? "—"}</Table.Td>
@@ -974,11 +1468,15 @@ export function App() {
     startup_id: string;
     report_version: string | null;
   } | null>(null);
+  const runMatch = window.location.pathname.match(/^\/runs\/(\d+)\/?$/);
+  const runJobId = runMatch ? Number(runMatch[1]) : null;
   const page: Page =
     window.location.pathname === "/billing"
       ? "billing"
       : window.location.pathname === "/cost-waste"
         ? "cost-waste"
+        : runJobId != null
+          ? "run"
         : "resources";
 
   useEffect(() => {
@@ -1080,6 +1578,7 @@ export function App() {
         {report && page === "resources" && <ResourcesPage report={report} />}
         {report && page === "billing" && <BillingPage report={report} />}
         {report && page === "cost-waste" && <CostWastePage report={report} />}
+        {report && page === "run" && runJobId != null && <RunPage report={report} jobId={runJobId} />}
       </AppShell.Main>
       <QueryStatusModal opened={statusOpened} onClose={() => setStatusOpened(false)} queryStatus={queryStatus} />
     </AppShell>

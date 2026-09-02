@@ -17,6 +17,8 @@ storage, or Zymtrace data is available.
     cost, retry, and ETA data.
   - Streams ANSI-colored CloudWatch logs in a full-screen drawer.
   - Links directly to SkyPilot, W&B, Zymtrace, and cloud storage.
+  - Provides a dedicated per-run page for status, timing, retries,
+    infrastructure, cost, links, and logs.
 - Cost and waste
   - Charts 30 days of AWS and GCP spend, stacked by cloud and by compute,
     storage, and other costs.
@@ -28,11 +30,9 @@ storage, or Zymtrace data is available.
   - Starts immediately, refreshes inventory periodically, and live-reloads
     Python and frontend changes while recovering from build or runtime errors.
 
-The internal report is resource-oriented rather than run-oriented. SkyPilot is
-currently the first cloud inventory provider, and Flow/W&B is the first optional
-training enrichment provider. Additional cloud accounts, schedulers, and training
-systems can be added without changing the rule that inventory determines which
-resources appear.
+SkyPilot is the authoritative inventory provider, and Flow/W&B is optional
+training enrichment. The browser renders only local raw cache files; a standalone
+collector owns provider access and refreshes those files before on-demand views.
 
 ## Install and run
 
@@ -58,6 +58,25 @@ overwatch --no-log-enrichment
 overwatch --gcp-billing-table my-project.billing.gcp_billing_export_v1_XXXXXX-XXXXXX-XXXXXX
 ```
 
+## Raw metric cache
+
+The standalone collector writes versioned, human-readable files beneath
+`~/.cache/overwatch/raw-v1`:
+
+```sh
+uv run python -m overwatch.collector
+uv run python -m overwatch.collector --job-id 183
+uv run python -m overwatch.collector --job-id 183 --full-logs
+cd ~/.cache/overwatch/raw-v1/jobs/183
+```
+
+Global provider snapshots live under `global/`. Each `jobs/<job_id>/` directory
+contains raw SkyPilot and W&B snapshots plus append-only CloudWatch
+`events.jsonl.zst`, its human-readable `events.index.json` block index, stream
+metadata, and a cursor. Use `zstdcat events.jsonl.zst` to inspect the raw JSONL.
+Finished jobs with a settled cursor are served from disk immediately. Bumping
+`raw-v1` is the migration strategy when the cache shape changes.
+
 ## Billing history
 
 AWS billing history uses the current AWS credentials and requires
@@ -74,5 +93,4 @@ Both providers are optional: a missing permission or billing export produces a
 warning without hiding the cloud resource inventory. GCP line series use the
 billing export's project IDs. The stacked categories use AWS service names and
 GCP service/SKU descriptions to classify compute and storage; all remaining
-charges are grouped as everything else. Successful billing queries are cached
-for one hour.
+charges are grouped as everything else.
