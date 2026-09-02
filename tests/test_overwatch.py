@@ -267,6 +267,15 @@ def test_raw_cloudwatch_cache_only_appends_new_events(
         "jobs", "183", "cloudwatch", "cursor.json"
     ).read_text()
 
+    # One damaged independent frame must not hide the remaining cached log history.
+    events_index = json.loads(events_index_path.read_text())
+    first_block = events_index["blocks"][0]
+    with events_path.open("r+b") as events_file:
+        events_file.seek(first_block["compressed_offset"])
+        events_file.write(b"\0" * first_block["compressed_size"])
+    surviving_page = cached_cloudwatch_log_page(183, from_start=True, limit=10)
+    assert [item["timestamp"] for item in surviving_page["events"]] == [2_000, 3_000]
+
 
 def test_raw_cache_snapshots_survive_overlapping_writes_and_corruption(
     tmp_path: Path,

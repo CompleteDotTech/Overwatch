@@ -5,7 +5,7 @@ from __future__ import annotations
 import gzip
 import heapq
 import json
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from datetime import UTC, datetime, timedelta
 from itertools import pairwise
 from types import SimpleNamespace
@@ -13,6 +13,7 @@ from typing import Any
 
 import pyzstd
 import yaml
+from loguru import logger
 
 from overwatch.cloudwatch_cache import cloudwatch_events_index_is_valid
 from overwatch.constants import (
@@ -37,6 +38,21 @@ from overwatch.utils import enum_value
 
 class CachedRun(SimpleNamespace):
     """Attribute adapter for a raw cached W&B run."""
+
+
+def decode_cached_cloudwatch_block(
+    compressed_block: bytes, job_id: int
+) -> list[str]:
+    """Decode one independent cache frame without failing the whole report."""
+    try:
+        return pyzstd.decompress(compressed_block).decode().splitlines(keepends=True)
+    except (UnicodeError, pyzstd.ZstdError) as error:
+        logger.warning(
+            "Skipping unreadable CloudWatch cache block for job {}: {}",
+            job_id,
+            error,
+        )
+        return []
 
 
 def iter_cached_cloudwatch_event_lines(
@@ -78,9 +94,7 @@ def iter_cached_cloudwatch_event_lines(
                     continue
                 events_file.seek(int(block["compressed_offset"]))
                 compressed_block = events_file.read(int(block["compressed_size"]))
-                yield from pyzstd.decompress(compressed_block).decode().splitlines(
-                    keepends=True
-                )
+                yield from decode_cached_cloudwatch_block(compressed_block, job_id)
         return
     if events_path.exists():
         with pyzstd.open(events_path, "rt") as events_file:
@@ -95,6 +109,35 @@ def iter_cached_cloudwatch_event_lines(
     if compressed_legacy_path.exists():
         with gzip.open(compressed_legacy_path, "rt") as events_file:
             yield from events_file
+
+
+def decode_cached_cloudwatch_event_lines(
+    lines: Iterable[str],
+) -> Iterator[dict[str, Any]]:
+    """Yield valid cached CloudWatch events with normalized timestamps."""
+    for line in lines:
+        try:
+            event = json.loads(line)
+            event["timestamp"] = int(event["timestamp"])
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            continue
+        yield event
+
+
+def iter_cached_cloudwatch_events(
+    job_id: int,
+    *,
+    minimum_timestamp: int | None = None,
+    maximum_timestamp: int | None = None,
+) -> Iterator[dict[str, Any]]:
+    """Yield valid events from every supported CloudWatch cache format."""
+    yield from decode_cached_cloudwatch_event_lines(
+        iter_cached_cloudwatch_event_lines(
+            job_id,
+            minimum_timestamp=minimum_timestamp,
+            maximum_timestamp=maximum_timestamp,
+        )
+    )
 
 
 def cached_sky_jobs() -> list[SimpleNamespace]:
@@ -317,13 +360,9 @@ def cached_cloudwatch_telemetry(
     """Parse progress and durable training references in one cached-log pass."""
     latest_messages: list[tuple[int, str]] = []
     references: dict[str, str] = {}
-    for line in iter_cached_cloudwatch_event_lines(job_id):
-        try:
-            event = json.loads(line)
-            message = cloudwatch_event_message(event)
-            timestamp = int(event["timestamp"])
-        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
-            continue
+    for event in iter_cached_cloudwatch_events(job_id):
+        message = cloudwatch_event_message(event)
+        timestamp = event["timestamp"]
         references.update(flow_references_from_cloudwatch_message(message))
         if "tok/s" in message:
             if len(latest_messages) < 1_000:
@@ -383,12 +422,8 @@ def cached_cloudwatch_attempts(
                     block_process_range["maximum_timestamp"],
                 )
     else:
-        for line in iter_cached_cloudwatch_event_lines(job_id):
-            try:
-                event = json.loads(line)
-                timestamp = int(event["timestamp"])
-            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
-                continue
+        for event in iter_cached_cloudwatch_events(job_id):
+            timestamp = event["timestamp"]
             first_event_timestamp = (
                 timestamp
                 if first_event_timestamp is None
@@ -464,13 +499,9 @@ def cached_cloudwatch_retry_breakdown(
             )
     else:
         # Legacy indexes are rare; retain correctness until the collector enriches them.
-        for line in iter_cached_cloudwatch_event_lines(job_id):
-            try:
-                event = json.loads(line)
-                pid = cloudwatch_event_pid(event)
-                message = cloudwatch_event_message(event)
-            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
-                continue
+        for event in iter_cached_cloudwatch_events(job_id):
+            pid = cloudwatch_event_pid(event)
+            message = cloudwatch_event_message(event)
             if pid is not None and cloudwatch_message_has_application_failure(message):
                 application_failure_pids.add(pid)
 
@@ -513,14 +544,12 @@ def cached_cloudwatch_log_page(
     before_key = parse_event_cursor(before)
     after_key = parse_event_cursor(after)
 
-    def matching_events_from_lines(lines: Iterator[str]) -> Iterator[dict[str, Any]]:
-        for line in lines:
-            try:
-                event = json.loads(line)
-                timestamp = int(event["timestamp"])
-                event_id = cloudwatch_event_id(event)
-            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
-                continue
+    def matching_events(
+        events: Iterable[dict[str, Any]],
+    ) -> Iterator[dict[str, Any]]:
+        for event in events:
+            timestamp = event["timestamp"]
+            event_id = cloudwatch_event_id(event)
             if started_after is not None and timestamp < started_after:
                 continue
             if ended_before is not None and timestamp >= ended_before:
@@ -577,12 +606,10 @@ def cached_cloudwatch_log_page(
             ):
                 events_file.seek(int(block["compressed_offset"]))
                 compressed_block = events_file.read(int(block["compressed_size"]))
-                block_lines = iter(
-                    pyzstd.decompress(compressed_block).decode().splitlines(
-                        keepends=True
-                    )
+                block_lines = decode_cached_cloudwatch_block(compressed_block, job_id)
+                page_events.extend(
+                    matching_events(decode_cached_cloudwatch_event_lines(block_lines))
                 )
-                page_events.extend(matching_events_from_lines(block_lines))
                 page_events = (
                     heapq.nsmallest(
                         limit + 1, page_events, key=cloudwatch_event_order
@@ -606,18 +633,20 @@ def cached_cloudwatch_log_page(
                     break
     else:
         # Legacy streams lack frame ranges and require one bounded full scan.
-        matching_events = matching_events_from_lines(
-            iter_cached_cloudwatch_event_lines(
+        matching_page_events = matching_events(
+            iter_cached_cloudwatch_events(
                 job_id,
                 minimum_timestamp=minimum_timestamp,
                 maximum_timestamp=maximum_timestamp,
             )
         )
         page_events = (
-            heapq.nsmallest(limit + 1, matching_events, key=cloudwatch_event_order)
+            heapq.nsmallest(
+                limit + 1, matching_page_events, key=cloudwatch_event_order
+            )
             if reading_forward
             else heapq.nlargest(
-                limit + 1, matching_events, key=cloudwatch_event_order
+                limit + 1, matching_page_events, key=cloudwatch_event_order
             )
         )
 
