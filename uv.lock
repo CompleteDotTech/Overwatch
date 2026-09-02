@@ -1162,7 +1162,6 @@ source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
     { name = "boto3" },
-    { name = "botocore" },
     { name = "google-cloud-bigquery" },
     { name = "loguru" },
     { name = "python-dotenv" },
@@ -1186,7 +1185,6 @@ dev = [
 requires-dist = [
     { name = "aiohttp", specifier = ">=3.10" },
     { name = "boto3", specifier = ">=1.35" },
-    { name = "botocore", specifier = ">=1.35" },
     { name = "google-cloud-bigquery", specifier = ">=3.38" },
     { name = "loguru", specifier = ">=0.7" },
     { name = "python-dotenv", specifier = ">=1" },

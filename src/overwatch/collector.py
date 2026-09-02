@@ -19,9 +19,8 @@ import shutil
 import threading
 from collections.abc import Iterator
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime
 from enum import Enum
-from itertools import islice
 from pathlib import Path
 from time import perf_counter
 from types import SimpleNamespace
@@ -30,16 +29,12 @@ from urllib.parse import urlparse
 
 import boto3
 import pyzstd
-import sky
-import sky.jobs
 import wandb
-from google.cloud import bigquery
 from loguru import logger
 
 from overwatch.constants import (
     ACTIVE_SKY_STATUSES,
     ANSI_ESCAPE_RE,
-    BILLING_HISTORY_DAYS,
     CLOUDWATCH_LOG_GROUP,
     CLOUDWATCH_REGION,
     RESOURCE_HISTORY_DAYS,
@@ -53,7 +48,12 @@ from overwatch.logs import (
     cloudwatch_message_has_application_failure,
     flow_references_from_cloudwatch_message,
 )
-from overwatch.providers.wandb_flow import match_skypilot_jobs
+from overwatch.providers.billing import (
+    collect_aws_billing_responses,
+    collect_gcp_billing_rows,
+)
+from overwatch.providers.sky import collect_managed_jobs, collect_standalone_clusters
+from overwatch.providers.wandb_flow import collect_recent_flow_runs, match_skypilot_jobs
 from overwatch.utils import enum_value, isoformat
 
 RAW_CACHE_SPEC_VERSION = 1
@@ -73,123 +73,6 @@ class CollectorOptions:
     limit: int = 20
     entity: str | None = None
     gcp_billing_table: str | None = None
-
-
-def collect_managed_jobs() -> list[Any]:
-    """Collect the unfiltered all-user SkyPilot managed-job response."""
-    fields = (
-        "job_id",
-        "job_name",
-        "status",
-        "resources",
-        "submitted_at",
-        "start_at",
-        "end_at",
-        "job_duration",
-        "recovery_count",
-        "last_recovered_at",
-        "cloud",
-        "region",
-        "zone",
-        "infra",
-        "details",
-        "failure_reason",
-        "user_name",
-        "metadata",
-        "links",
-    )
-    result = sky.get(
-        sky.jobs.queue_v2(
-            refresh=False,
-            all_users=True,
-            limit=None,
-            fields=fields,
-            sort_by="submitted_at",
-            sort_order="desc",
-        )
-    )
-    return result[0] if isinstance(result, tuple) else result
-
-
-def collect_standalone_clusters() -> list[Any]:
-    """Collect the unfiltered all-user SkyPilot cluster response."""
-    return sky.get(sky.status(all_users=True))
-
-
-async def collect_recent_flow_runs(
-    api: wandb.Api, entity: str, limit: int
-) -> list[Any]:
-    """Collect raw hydrated W&B records for recent and running Flow runs."""
-    projects = await asyncio.to_thread(lambda: list(api.projects(entity)))
-    semaphore = asyncio.Semaphore(16)
-
-    async def project_runs(project: Any, *, running_only: bool) -> list[Any]:
-        async with semaphore:
-            return await asyncio.to_thread(
-                lambda: list(
-                    api.runs(
-                        f"{entity}/{project.name}",
-                        filters={"state": "running"} if running_only else None,
-                        order="-created_at",
-                        per_page=max(50, limit),
-                    )
-                    if running_only
-                    else islice(
-                        api.runs(
-                            f"{entity}/{project.name}",
-                            order="-created_at",
-                            per_page=limit,
-                        ),
-                        limit,
-                    )
-                )
-            )
-
-    recent_by_project, running_by_project = await asyncio.gather(
-        asyncio.gather(
-            *(project_runs(project, running_only=False) for project in projects)
-        ),
-        asyncio.gather(
-            *(project_runs(project, running_only=True) for project in projects)
-        ),
-    )
-    recent_candidates = [
-        run
-        for project_runs_result in recent_by_project
-        for run in project_runs_result
-    ]
-    running_candidates = [
-        run
-        for project_runs_result in running_by_project
-        for run in project_runs_result
-    ]
-    recent_candidates.sort(key=lambda run: run.created_at or "", reverse=True)
-    candidates_by_path = {
-        "/".join(run.path): run
-        for run in [*recent_candidates[: limit * 2], *running_candidates]
-    }
-
-    # Hydration preserves the raw config used to identify and render Flow runs.
-    async def hydrate_run(run: Any) -> Any:
-        async with semaphore:
-            return await asyncio.to_thread(api.run, "/".join(run.path))
-
-    hydrated_runs = await asyncio.gather(
-        *(hydrate_run(run) for run in candidates_by_path.values())
-    )
-    flow_runs = [
-        run for run in hydrated_runs if run.config.get("_id_") == "TrainConfig"
-    ]
-    flow_runs.sort(key=lambda run: run.created_at or "", reverse=True)
-    selected_runs = flow_runs[:limit]
-    selected_paths = {tuple(run.path) for run in selected_runs}
-    selected_runs.extend(
-        run
-        for run in flow_runs
-        if run.state == "running" and tuple(run.path) not in selected_paths
-    )
-    selected_runs.sort(key=lambda run: run.created_at or "", reverse=True)
-    return selected_runs
 
 
 def resolve_cloudwatch_stream_name(
@@ -557,79 +440,6 @@ def serialize_wandb_run(run: Any) -> dict[str, Any]:
         "config": json_safe(dict(run.config)),
         "summary": json_safe(dict(run.summary)),
         "metadata": json_safe(getattr(run, "_metadata", None)),
-    }
-
-
-def collect_aws_billing_responses() -> dict[str, Any]:
-    """Collect unmodified paginated Cost Explorer responses."""
-    today = datetime.now(UTC).date()
-    request_arguments: dict[str, Any] = {
-        "TimePeriod": {
-            "Start": (today - timedelta(days=BILLING_HISTORY_DAYS - 1)).isoformat(),
-            "End": (today + timedelta(days=1)).isoformat(),
-        },
-        "Granularity": "DAILY",
-        "Metrics": ["NetUnblendedCost"],
-        "GroupBy": [{"Type": "DIMENSION", "Key": "SERVICE"}],
-    }
-    client = boto3.client("ce", region_name="us-east-1")
-    responses = []
-    next_page_token = None
-    while True:
-        page_arguments = dict(request_arguments)
-        if next_page_token:
-            page_arguments["NextPageToken"] = next_page_token
-        response = client.get_cost_and_usage(**page_arguments)
-        responses.append(response)
-        next_page_token = response.get("NextPageToken")
-        if not next_page_token:
-            break
-    return {"request": request_arguments, "responses": responses}
-
-
-def collect_gcp_billing_rows(billing_table: str) -> dict[str, Any]:
-    """Collect minimally aggregated raw BigQuery rows by project, service, and SKU."""
-    today = datetime.now(UTC).date()
-    start_date = today - timedelta(days=BILLING_HISTORY_DAYS - 1)
-    end_date = today + timedelta(days=1)
-    query = f"""
-        SELECT
-          DATE(usage_start_time) AS usage_date,
-          project.id AS project_id,
-          service.description AS service_description,
-          sku.description AS sku_description,
-          currency,
-          CAST(SUM(cost) AS FLOAT64) AS cost,
-          CAST(SUM(IFNULL((
-            SELECT SUM(credit.amount) FROM UNNEST(credits) AS credit
-          ), 0)) AS FLOAT64) AS credits,
-          CAST(ANY_VALUE(currency_conversion_rate) AS FLOAT64) AS currency_conversion_rate
-        FROM `{billing_table}`
-        WHERE usage_start_time >= TIMESTAMP(@start_date)
-          AND usage_start_time < TIMESTAMP(@end_date)
-        GROUP BY usage_date, project_id, service_description, sku_description, currency
-        ORDER BY usage_date, project_id, service_description, sku_description
-    """
-    parameters = {
-        "start_date": start_date.isoformat(),
-        "end_date": end_date.isoformat(),
-    }
-    job_config = bigquery.QueryJobConfig(
-        query_parameters=[
-            bigquery.ScalarQueryParameter("start_date", "DATE", start_date),
-            bigquery.ScalarQueryParameter("end_date", "DATE", end_date),
-        ]
-    )
-    rows = (
-        bigquery.Client(project=billing_table.split(".", 1)[0])
-        .query(query, job_config=job_config)
-        .result()
-    )
-    return {
-        "table": billing_table,
-        "query": query,
-        "parameters": parameters,
-        "rows": [dict(row.items()) for row in rows],
     }
 
 

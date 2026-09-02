@@ -1,7 +1,6 @@
 """Focused regression coverage for Overwatch."""
 
-import asyncio
-from datetime import date
+from datetime import UTC, datetime, timedelta
 from importlib.resources import files
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,18 +9,18 @@ import pytest
 
 from overwatch import collector
 from overwatch.cached_metrics import (
+    cached_billing_report,
     cached_cloudwatch_attempts,
     cached_cloudwatch_log_page,
     cached_cloudwatch_retry_breakdown,
+    cached_sky_clusters,
+    cached_sky_jobs,
 )
 from overwatch.logs import (
     ansi_log_text_to_safe_html,
-    discover_cloudwatch_attempts,
     flow_progress_from_log_text,
     flow_references_from_cloudwatch_message,
-    tail_cloudwatch_job_log,
 )
-from overwatch.providers import billing
 from overwatch.providers.sky import collect_managed_jobs, collect_standalone_clusters
 from overwatch.providers.wandb_flow import match_skypilot_jobs
 from overwatch.report import (
@@ -80,99 +79,6 @@ def test_wandb_matching_prefers_exact_haiku_name_then_normalizes_both_sides() ->
 
     assert match_skypilot_jobs([run], [resumed_job, exact_job]) == [exact_job]
     assert match_skypilot_jobs([run], [resumed_job]) == [resumed_job]
-
-def test_cloudwatch_progress_uses_one_bounded_latest_tail_request() -> None:
-    requests = []
-
-    class CloudWatchClient:
-        def describe_log_streams(self, **_kwargs: object) -> dict[str, object]:
-            return {
-                "logStreams": [{"logStreamName": "stream", "lastEventTimestamp": 1}]
-            }
-
-        def get_log_events(self, **kwargs: object) -> dict[str, object]:
-            requests.append(kwargs)
-            return {
-                "events": [
-                    {
-                        "message": f"event-{index} tok/s"
-                        if index >= 400
-                        else f"event-{index}"
-                    }
-                    for index in range(1_400)
-                ]
-            }
-
-    job = SimpleNamespace(
-        cloud="aws",
-        links={"AWS Instances": "https://example.test/?tag:ray-cluster-name=cluster"},
-    )
-
-    log_text, error = asyncio.run(
-        tail_cloudwatch_job_log(job, CloudWatchClient(), asyncio.Semaphore(1))
-    )
-
-    assert error is None
-    assert log_text is not None
-    assert log_text.splitlines()[0] == "event-400 tok/s"
-    assert log_text.splitlines()[-1] == "event-1399 tok/s"
-    assert len(log_text.splitlines()) == 1_000
-    assert len(requests) == 1
-    assert requests[0]["startFromHead"] is False
-    assert requests[0]["limit"] == 10_000
-
-
-def test_cloudwatch_attempt_discovery_finds_each_process_without_full_scan() -> None:
-    attempts = [(1_000, 11), (401_000, 22), (801_000, 33)]
-    requests = []
-
-    class CloudWatchClient:
-        def describe_log_streams(self, **_kwargs: object) -> dict[str, object]:
-            return {
-                "logStreams": [
-                    {
-                        "logStreamName": "stream",
-                        "firstEventTimestamp": 1_000,
-                        "lastEventTimestamp": 1_200_000,
-                    }
-                ]
-            }
-
-        def get_log_events(self, **kwargs: object) -> dict[str, object]:
-            requests.append(kwargs)
-            start_time = int(kwargs["startTime"])
-            pid = next(
-                pid
-                for index, (timestamp, pid) in enumerate(attempts)
-                if timestamp <= start_time
-                and (index + 1 == len(attempts) or start_time < attempts[index + 1][0])
-            )
-            return {
-                "events": [
-                    {
-                        "timestamp": start_time,
-                        "message": f'{{"pid":{pid},"log_line":"line"}}',
-                    }
-                ]
-            }
-
-    discovered = discover_cloudwatch_attempts(CloudWatchClient(), "stream", 3)
-
-    assert [attempt["pid"] for attempt in discovered] == [11, 22, 33]
-    assert [attempt["attempt"] for attempt in discovered] == [1, 2, 3]
-    assert 1_000 <= discovered[0]["tail_at"] < 401_000
-    assert 401_000 <= discovered[1]["tail_at"] < 801_000
-    assert 801_000 <= discovered[2]["tail_at"] <= 1_200_000
-    assert all(request["limit"] == 100 for request in requests)
-
-    # A new recovery resumes discovery at the last cached process instead of rescanning history.
-    requests.clear()
-    suffix = discover_cloudwatch_attempts(
-        CloudWatchClient(), "stream", 2, start_timestamp=401_000
-    )
-    assert [attempt["pid"] for attempt in suffix] == [22, 33]
-    assert all(int(request["startTime"]) >= 401_000 for request in requests)
-
 
 def test_raw_cloudwatch_cache_only_appends_new_events(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -310,9 +216,9 @@ def test_cost_scaling_and_packaged_browser_assets(
 
 
 def test_sky_inventory_is_unbounded_and_includes_standalone_clusters(
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    now = 1_800_000_000
+    now = datetime.now(UTC).timestamp()
     active_job = SimpleNamespace(
         job_id=7,
         job_name="linked-job",
@@ -385,15 +291,57 @@ def test_sky_inventory_is_unbounded_and_includes_standalone_clusters(
             ]
         ),
     )
-    monkeypatch.setattr("overwatch.providers.sky.time.time", lambda: now)
+    raw_jobs = collect_managed_jobs()
+    raw_clusters = collect_standalone_clusters()
 
-    jobs = collect_managed_jobs()
-    clusters = collect_standalone_clusters()
+    # Cache readers, rather than provider adapters, own display-window filtering.
+    monkeypatch.setattr(collector, "RAW_CACHE_ROOT", tmp_path / "raw-v1")
+    collector.write_json_atomically(
+        collector.raw_cache_path("global", "sky", "jobs.json"),
+        [
+            {"job_id": 8, "status": "SUCCEEDED", "end_at": now - 86400},
+            {"job_id": 9, "status": "FAILED", "end_at": 0},
+            {
+                "job_id": 7,
+                "status": "RUNNING",
+                "end_at": now - 30 * 86400,
+                "submitted_at": now,
+            },
+        ],
+    )
+    collector.write_json_atomically(
+        collector.raw_cache_path("global", "sky", "clusters.json"),
+        [
+            {"name": "managed", "is_managed": True, "status": "UP"},
+            {"name": "dev", "is_managed": False, "status": "UP"},
+            {
+                "name": "recent-stopped",
+                "is_managed": False,
+                "status": "STOPPED",
+                "status_updated_at": now - 86400,
+            },
+            {
+                "name": "old-stopped",
+                "is_managed": False,
+                "status": "STOPPED",
+                "status_updated_at": 0,
+            },
+        ],
+    )
+    jobs = cached_sky_jobs()
+    clusters = cached_sky_clusters()
     record = build_cluster_record(dev_cluster, "project-id")
     sky_only_record = build_sky_only_record(active_job, None, None, "project-id")
 
-    assert jobs == [active_job, recent_finished_job]
-    assert clusters == [dev_cluster, recent_stopped_cluster]
+    assert raw_jobs == [recent_finished_job, old_finished_job, active_job]
+    assert raw_clusters == [
+        managed_cluster,
+        dev_cluster,
+        recent_stopped_cluster,
+        old_stopped_cluster,
+    ]
+    assert [job.job_id for job in jobs] == [7, 8]
+    assert [cluster.name for cluster in clusters] == ["dev", "recent-stopped"]
     assert requests[0]["limit"] is None
     assert requests[0]["all_users"] is True
     assert requests[1]["all_users"] is True
@@ -416,60 +364,91 @@ def test_sky_inventory_is_unbounded_and_includes_standalone_clusters(
 
 
 def test_daily_cloud_spend_aligns_sparse_provider_days_and_totals(
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    billing._billing_cache.clear()
+    today = datetime.now(UTC).date()
+    first_day = (today - timedelta(days=29)).isoformat()
+    last_day = today.isoformat()
+    monkeypatch.setattr(collector, "RAW_CACHE_ROOT", tmp_path / "raw-v1")
 
-    # Replace provider calls so date-window normalization is independent of cloud accounts.
-    monkeypatch.setattr(
-        billing,
-        "collect_aws_daily_spend",
-        lambda _start, _end: (
-            {"2026-08-01": 10.125, "2026-08-30": 5.0},
-            {
-                "2026-08-01": {
-                    "compute": 8.0,
-                    "storage": 2.125,
-                    "everything_else": 0.0,
-                },
-                "2026-08-30": {
-                    "compute": 5.0,
-                    "storage": 0.0,
-                    "everything_else": 0.0,
-                },
-            },
-        ),
+    # Normalize the same raw response shape that the production collector persists.
+    collector.write_json_atomically(
+        collector.raw_cache_path("global", "billing", "aws.json"),
+        {
+            "responses": [
+                {
+                    "ResultsByTime": [
+                        {
+                            "TimePeriod": {"Start": first_day},
+                            "Groups": [
+                                {
+                                    "Keys": ["Amazon Elastic Compute Cloud"],
+                                    "Metrics": {
+                                        "NetUnblendedCost": {"Amount": "8.0"}
+                                    },
+                                },
+                                {
+                                    "Keys": ["Amazon Simple Storage Service"],
+                                    "Metrics": {
+                                        "NetUnblendedCost": {"Amount": "2.125"}
+                                    },
+                                },
+                            ],
+                        },
+                        {
+                            "TimePeriod": {"Start": last_day},
+                            "Groups": [
+                                {
+                                    "Keys": ["Amazon Elastic Compute Cloud"],
+                                    "Metrics": {
+                                        "NetUnblendedCost": {"Amount": "5.0"}
+                                    },
+                                }
+                            ],
+                        },
+                    ]
+                }
+            ]
+        },
     )
-    monkeypatch.setattr(
-        billing,
-        "collect_gcp_daily_spend",
-        lambda _table, _start, _end: (
-            {
-                "project-a": {"2026-08-30": 2.25},
-                "project-b": {"2026-08-01": 1.0},
-            },
-            {
-                "2026-08-01": {
-                    "compute": 0.0,
-                    "storage": 0.0,
-                    "everything_else": 1.0,
+    collector.write_json_atomically(
+        collector.raw_cache_path("global", "billing", "gcp.json"),
+        {
+            "rows": [
+                {
+                    "usage_date": first_day,
+                    "project_id": "project-b",
+                    "service_description": "Other",
+                    "sku_description": "Other",
+                    "cost": 1.0,
+                    "credits": 0.0,
+                    "currency_conversion_rate": 1.0,
                 },
-                "2026-08-30": {
-                    "compute": 2.0,
-                    "storage": 0.25,
-                    "everything_else": 0.0,
+                {
+                    "usage_date": last_day,
+                    "project_id": "project-a",
+                    "service_description": "Compute Engine",
+                    "sku_description": "CPU",
+                    "cost": 2.0,
+                    "credits": 0.0,
+                    "currency_conversion_rate": 1.0,
                 },
-            },
-        ),
+                {
+                    "usage_date": last_day,
+                    "project_id": "project-a",
+                    "service_description": "Storage",
+                    "sku_description": "Disk",
+                    "cost": 0.25,
+                    "credits": 0.0,
+                    "currency_conversion_rate": 1.0,
+                },
+            ]
+        },
     )
+    result = cached_billing_report({"sources": {}})
 
-    result = billing.collect_daily_cloud_spend(
-        "project.dataset.gcp_billing_export_v1_account",
-        today=date(2026, 8, 30),
-    )
-
-    assert result["start_date"] == "2026-08-01"
-    assert result["end_date"] == "2026-08-30"
+    assert result["start_date"] == first_day
+    assert result["end_date"] == last_day
     assert len(result["daily"]) == 30
     assert [series["label"] for series in result["series"]] == [
         "AWS",
@@ -478,21 +457,21 @@ def test_daily_cloud_spend_aligns_sparse_provider_days_and_totals(
         "Combined",
     ]
     assert result["daily"][0] == {
-        "date": "2026-08-01",
+        "date": first_day,
         "aws": 10.12,
         "gcp_0": 0.0,
         "gcp_1": 1.0,
         "combined": 11.12,
     }
     assert result["daily"][-1] == {
-        "date": "2026-08-30",
+        "date": last_day,
         "aws": 5.0,
         "gcp_0": 2.25,
         "gcp_1": 0.0,
         "combined": 7.25,
     }
     assert result["category_daily"][0] == {
-        "date": "2026-08-01",
+        "date": first_day,
         "aws_compute": 8.0,
         "aws_storage": 2.12,
         "aws_everything_else": 0.0,

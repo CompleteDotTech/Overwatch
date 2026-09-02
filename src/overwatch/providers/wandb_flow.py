@@ -40,7 +40,7 @@ def flow_config_uri_from_run(
 async def collect_recent_flow_runs(
     api: wandb.Api, entity: str, limit: int
 ) -> list[Any]:
-    """Collect the last N Flow runs plus every running Flow run."""
+    """Collect raw hydrated records for recent and running Flow runs."""
     projects = await asyncio.to_thread(lambda: list(api.projects(entity)))
     semaphore = asyncio.Semaphore(16)
 

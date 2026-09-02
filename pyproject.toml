@@ -7,7 +7,6 @@ requires-python = ">=3.13.12,<3.14"
 dependencies = [
     "aiohttp>=3.10",
     "boto3>=1.35",
-    "botocore>=1.35",
     "google-cloud-bigquery>=3.38",
     "loguru>=0.7",
     "python-dotenv>=1",
@@ -50,3 +49,4 @@ explicit = true
 [tool.deptry.package_module_name_map]
 python-dotenv = "dotenv"
 skypilot = "sky"
+tspath = "typesafe"
