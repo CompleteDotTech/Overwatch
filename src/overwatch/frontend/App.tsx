@@ -283,6 +283,7 @@ function ResourcesTable({ resources }: { resources: Resource[] }) {
             resource.user,
             resource.project,
             resource.wandb_id,
+            resource.git.commit,
             resource.kind,
             resource.status.skypilot,
             resource.status.wandb,
@@ -330,12 +331,24 @@ function ResourcesTable({ resources }: { resources: Resource[] }) {
             onChange={(event) => setSearchQuery(event.currentTarget.value)}
           />
         </Box>}
-        <Table.ScrollContainer minWidth={1320}>
-          <Table striped highlightOnHover verticalSpacing="sm">
+        <Table.ScrollContainer minWidth={0}>
+          <Table className="resources-table" striped highlightOnHover verticalSpacing="sm">
+            <colgroup>
+              <col style={{ width: "21%" }} />
+              <col style={{ width: "16%" }} />
+              <col style={{ width: "7%" }} />
+              <col style={{ width: "13%" }} />
+              <col style={{ width: "9%" }} />
+              <col style={{ width: "10%" }} />
+              <col style={{ width: "10%" }} />
+              <col style={{ width: "10%" }} />
+              <col style={{ width: "4%" }} />
+            </colgroup>
             <Table.Thead>
               <Table.Tr>
-                <SortHeader label="User / project / run" value="name" active={sortKey === "name"} descending={descending} onSort={onSort} />
-                <SortHeader label="Status" secondaryLabel="then newest started" value="status" active={sortKey === "status"} descending={descending} onSort={onSort} />
+                <SortHeader label="User / job ID" secondaryLabel="project / experiment" value="name" active={sortKey === "name"} descending={descending} onSort={onSort} />
+                <SortHeader label="Status" secondaryLabel="running, then newest submitted" value="status" active={sortKey === "status"} descending={descending} onSort={onSort} />
+                <Table.Th>Git checkout</Table.Th>
                 <SortHeader label="Progress" value="progress" active={sortKey === "progress"} descending={descending} onSort={onSort} />
                 <Table.Th>
                   Retries
@@ -350,7 +363,7 @@ function ResourcesTable({ resources }: { resources: Resource[] }) {
             <Table.Tbody>
               {sortedResources.length === 0 && (
                 <Table.Tr>
-                  <Table.Td colSpan={8}>
+                  <Table.Td colSpan={9}>
                     <Center py="xl">
                       <Text c="dimmed">No resources match “{searchQuery.trim()}”.</Text>
                     </Center>
@@ -361,12 +374,27 @@ function ResourcesTable({ resources }: { resources: Resource[] }) {
                 const progress = Math.max(0, Math.min(100, (resource.progress.progress_fraction ?? 0) * 100));
                 return (
                   <Table.Tr key={`${resource.kind}-${resource.skypilot.job_id ?? resource.name}`}>
-                    <Table.Td miw={280}>
+                    <Table.Td>
                       <Text size="xs" c="dimmed">
-                        {resource.user ?? "—"} / {resource.project ?? "—"}
-                        {resource.skypilot.job_id != null && ` · Sky job ${resource.skypilot.job_id}`}
+                        {resource.user ?? "—"} / {resource.skypilot.job_id ?? "—"}
                       </Text>
-                      <ResourceNameLink resource={resource} />
+                      <Stack gap={0}>
+                        <Group gap={4} wrap="nowrap">
+                          {resource.project && resource.links.wandb ? (
+                            <Anchor
+                              href={resource.links.wandb.split("/runs/", 1)[0]}
+                              target="_blank"
+                              rel="noreferrer"
+                            >
+                              {resource.project}
+                            </Anchor>
+                          ) : (
+                            <Text>{resource.project ?? "—"}</Text>
+                          )}
+                          <Text>/</Text>
+                        </Group>
+                        <ResourceNameLink resource={resource} />
+                      </Stack>
                     </Table.Td>
                     <Table.Td>
                       <Stack gap={4} align="flex-start">
@@ -374,7 +402,16 @@ function ResourcesTable({ resources }: { resources: Resource[] }) {
                         <Badge color={statusColor(resource.status.skypilot)} variant="light">Sky · {resource.status.skypilot ?? "unknown"}</Badge>
                       </Stack>
                     </Table.Td>
-                    <Table.Td miw={180}>
+                    <Table.Td>
+                      {resource.git.commit && resource.git.url ? (
+                        <Anchor ff="monospace" href={resource.git.url} target="_blank" rel="noreferrer">
+                          {resource.git.commit.slice(0, 8)}
+                        </Anchor>
+                      ) : (
+                        <Text c="dimmed">—</Text>
+                      )}
+                    </Table.Td>
+                    <Table.Td>
                       {resource.progress.total_batches ? (
                         <Stack gap={4}>
                           <Text size="xs">{resource.progress.completed_batches?.toLocaleString()}/{resource.progress.total_batches.toLocaleString()} batches</Text>
@@ -388,18 +425,18 @@ function ResourcesTable({ resources }: { resources: Resource[] }) {
                       {resource.progress.tokens_per_second != null && <Text size="xs" c="dimmed" mt={4}>{resource.progress.tokens_per_second.toLocaleString()} tok/s</Text>}
                     </Table.Td>
                     <Table.Td>{resource.retries.total_recoveries ?? "?"} | {resource.retries.preemption_or_infrastructure ?? "?"} | {resource.retries.application_error ?? "?"}</Table.Td>
-                    <Table.Td miw={150}>
+                    <Table.Td>
                       <Text size="xs" c="dimmed">{formatTimestamp(resource.timing.started_at)}</Text>
                       <Text>{formatDuration(resource.timing.elapsed_seconds)} &gt; {formatDuration(resource.progress.estimated_remaining_seconds)}</Text>
                     </Table.Td>
-                    <Table.Td miw={150}>
+                    <Table.Td>
                       <Text>{formatMoney(resource.cost.estimated_spend_usd)} / {formatMoney(resource.cost.estimated_total_usd)}</Text>
                       <Text size="xs" c="dimmed">{formatMoney(resource.cost.hourly_usd)}/hr</Text>
                     </Table.Td>
-                    <Table.Td miw={150}>
+                    <Table.Td>
                       <Text>{resource.skypilot.cloud ?? "—"}</Text>
                       <Text size="xs" c="dimmed">{resource.skypilot.region ?? "—"}</Text>
-                      <Text size="xs" ff="monospace" mt={3}>{resource.skypilot.resources ?? "—"}</Text>
+                      <Text size="xs" ff="monospace" mt={3} style={{ overflowWrap: "anywhere" }}>{resource.skypilot.resources ?? "—"}</Text>
                     </Table.Td>
                     <Table.Td><ResourceLinks resource={resource} /></Table.Td>
                   </Table.Tr>

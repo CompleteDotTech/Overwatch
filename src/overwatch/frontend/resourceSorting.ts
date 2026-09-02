@@ -2,30 +2,6 @@ import type { Resource } from "./types";
 
 export type ResourceSortKey = "name" | "status" | "progress" | "started" | "cost" | "cloud";
 
-const STATUS_LIFECYCLE_ORDER = new Map<string, number>([
-  ["INIT", 0],
-  ["PENDING", 1],
-  ["SUBMITTED", 1],
-  ["STARTING", 1],
-  ["RUNNING", 2],
-  ["UP", 2],
-  ["RECOVERING", 2],
-  ["WINDING_DOWN", 3],
-  ["CANCELLING", 3],
-  ["AUTOSTOPPING", 3],
-  ["SUCCEEDED", 4],
-  ["FINISHED", 4],
-  ["DONE", 4],
-  ["CANCELLED", 5],
-  ["CANCELED", 5],
-]);
-
-function resourceStatusOrder(resource: Resource): number {
-  const status = resource.status.skypilot?.toUpperCase() ?? "";
-  if (status.startsWith("FAILED")) return 6;
-  return STATUS_LIFECYCLE_ORDER.get(status) ?? 7;
-}
-
 function resourceSortValue(resource: Resource, sortKey: ResourceSortKey): string | number {
   if (sortKey === "name") return `${resource.user}/${resource.project}/${resource.name}`;
   if (sortKey === "progress") return resource.progress.progress_fraction ?? -1;
@@ -40,17 +16,15 @@ export function compareResources(
   sortKey: ResourceSortKey,
   descending: boolean,
 ): number {
-  // Keep the operational lifecycle primary regardless of the selected detail column.
-  const statusComparison = resourceStatusOrder(left) - resourceStatusOrder(right);
-  if (statusComparison !== 0) {
-    return sortKey === "status" && descending ? -statusComparison : statusComparison;
-  }
-
-  // Default to the newest start within each lifecycle stage.
+  // Keep running jobs at the top, then order both groups by newest submission.
   if (sortKey === "status") {
-    const startedComparison = (right.timing.started_at ?? "").localeCompare(left.timing.started_at ?? "");
-    if (startedComparison !== 0) return startedComparison;
-    return left.name.localeCompare(right.name, undefined, { numeric: true });
+    const runningComparison =
+      Number(right.status.skypilot?.toUpperCase() === "RUNNING") -
+      Number(left.status.skypilot?.toUpperCase() === "RUNNING");
+    const submittedComparison = (right.submitted_at ?? "").localeCompare(left.submitted_at ?? "");
+    const comparison = runningComparison || submittedComparison ||
+      left.name.localeCompare(right.name, undefined, { numeric: true });
+    return descending ? -comparison : comparison;
   }
 
   const leftValue = resourceSortValue(left, sortKey);

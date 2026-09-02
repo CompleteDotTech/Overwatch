@@ -36,6 +36,7 @@ export interface Resource {
   project: string | null;
   user: string | null;
   wandb_id: string | null;
+  git: { commit: string | null; url: string | null };
   submitted_at: string | null;
   status: { wandb: string | null; skypilot: string | null };
   progress: {

@@ -385,6 +385,7 @@ def test_sky_inventory_is_unbounded_and_includes_standalone_clusters(
         user_name="erik",
         cloud="aws",
         region="us-west-2",
+        metadata={"git_commit": "0123456789abcdef"},
     )
     recent_finished_job = SimpleNamespace(
         job_id=8, status=SimpleNamespace(value="SUCCEEDED"), end_at=now - 86400
@@ -506,6 +507,10 @@ def test_sky_inventory_is_unbounded_and_includes_standalone_clusters(
     # Preserve scheduler-provided telemetry links even when W&B enrichment misses the run.
     assert sky_only_record["wandb_id"] == "wandb123"
     assert sky_only_record["links"]["wandb"].endswith("/runs/wandb123")
+    assert sky_only_record["git"] == {
+        "commit": "0123456789abcdef",
+        "url": "https://github.com/typesafe-ai/Flow/commit/0123456789abcdef",
+    }
 
     # A malformed optional Sky price must not prevent the cluster from appearing.
     dev_cluster.handle.launched_resources = SimpleNamespace(

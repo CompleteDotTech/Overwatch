@@ -23,6 +23,7 @@ function resource(
     project: "project",
     user: "owner",
     wandb_id: overrides.wandbId === undefined ? "run" : overrides.wandbId,
+    git: { commit: null, url: null },
     submitted_at: null,
     status: { wandb: null, skypilot: overrides.active === false ? "SUCCEEDED" : "RUNNING" },
     progress: {

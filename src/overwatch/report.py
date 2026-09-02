@@ -22,6 +22,21 @@ from overwatch.utils import (
     timestamp_from_epoch,
 )
 
+FLOW_GITHUB_URL = "https://github.com/typesafe-ai/Flow"
+
+
+def git_checkout_from_job_or_wandb_run(
+    job: Any | None, run: Any | None = None
+) -> dict[str, str | None]:
+    """Build the Git checkout identity and its canonical commit link."""
+    job_metadata = getattr(job, "metadata", None) or {}
+    run_attributes = getattr(run, "attrs", None) or {}
+    commit = job_metadata.get("git_commit") or run_attributes.get("commit")
+    return {
+        "commit": str(commit) if commit else None,
+        "url": f"{FLOW_GITHUB_URL}/commit/{commit}" if commit else None,
+    }
+
 
 def estimated_hourly_cost(job: Any) -> tuple[float | None, str | None]:
     resources = job.resources or ""
@@ -226,6 +241,7 @@ def build_run_record(
         "project": run.project,
         "user": config.get("user") or (job.user_name if job else None),
         "wandb_id": run.id,
+        "git": git_checkout_from_job_or_wandb_run(job, run),
         "submitted_at": isoformat(parse_utc(run.created_at)),
         "status": {
             "wandb": run.state,
@@ -366,6 +382,7 @@ def build_sky_only_record(
         or (wandb_path_parts[-3] if len(wandb_path_parts) >= 3 else None),
         "user": config.get("user") or job.user_name,
         "wandb_id": wandb_url.rstrip("/").rsplit("/", 1)[-1] if wandb_url else None,
+        "git": git_checkout_from_job_or_wandb_run(job),
         "submitted_at": isoformat(timestamp_from_epoch(job.submitted_at)),
         "status": {"wandb": None, "skypilot": enum_value(job.status)},
         "progress": {
@@ -476,6 +493,7 @@ def build_cluster_record(cluster: Any, zymtrace_project_id: str) -> dict[str, An
         "project": None,
         "user": cluster.user_name,
         "wandb_id": None,
+        "git": {"commit": None, "url": None},
         "submitted_at": isoformat(started_at),
         "status": {"wandb": None, "skypilot": status},
         "progress": {

@@ -175,6 +175,11 @@ h1.mantine-Title-root {
   background: rgb(250 156 30 / 7%);
 }
 
+.resources-table {
+  table-layout: fixed;
+  width: 100%;
+}
+
 .mantine-Progress-root {
   border: 1px solid var(--hud-border-soft);
   clip-path: polygon(4px 0, 100% 0, calc(100% - 4px) 100%, 0 100%);
