@@ -106,7 +106,7 @@ def configure_colored_logging() -> None:
     )
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--limit",
@@ -148,13 +148,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-open", action="store_true", help="do not open the monitor in Chrome"
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.limit <= 0:
         parser.error("--limit must be positive")
     if not 1 <= args.port <= 65535:
         parser.error("--port must be between 1 and 65535")
     if args.refresh_interval <= 0:
         parser.error("--refresh-interval must be positive")
+    # Binding to wildcard addresses exposes the unauthenticated dashboard to the
+    # network. Require an explicit opt-in so an open instance is never accidental.
+    if args.host in {"0.0.0.0", "::"} and os.environ.get("OVERWATCH_ALLOW_PUBLIC") != "1":
+        parser.error(
+            f"--host {args.host} would expose the unauthenticated monitor publicly; "
+            "set OVERWATCH_ALLOW_PUBLIC=1 to confirm"
+        )
     return args
 
 
