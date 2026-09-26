@@ -16,6 +16,7 @@ from overwatch.constants import (
 from overwatch.providers.wandb_flow import match_skypilot_jobs
 from overwatch.report import (
     build_cluster_record,
+    build_model_runs_report,
     build_run_record,
     build_sky_only_record,
 )
@@ -27,6 +28,7 @@ QUERY_LABELS = {
     "sky_clusters": "SkyPilot clusters",
     "billing": "Cloud billing",
     "wandb": "W&B training runs",
+    "kev_laya": "Kev-Laya model telemetry",
     "cloudwatch": "CloudWatch progress",
 }
 
@@ -47,6 +49,7 @@ async def collect_report_from_raw_cache(
         cached_sky_jobs,
         cached_train_config,
         cached_wandb_runs,
+        cached_kev_laya_runs,
         raw_cache_manifest,
     )
     from overwatch.collector import CollectorOptions, collect_raw_metrics
@@ -54,6 +57,7 @@ async def collect_report_from_raw_cache(
 
     options = CollectorOptions(
         limit=args.limit,
+        local_models_only=bool(getattr(args, "local_models_only", False)) or os.environ.get("OVERWATCH_LOCAL_MODELS_ONLY") == "1",
         entity=args.entity,
         gcp_billing_table=(
             getattr(args, "gcp_billing_table", None)
@@ -109,6 +113,7 @@ async def collect_report_from_raw_cache(
                 ],
             ),
             "wandb": ("wandb", [raw_cache_path("global", "wandb", "runs.json")]),
+            "kev_laya": ("kev_laya", [raw_cache_path("global", "kev_laya", "runs-v2.json")]),
             "cloudwatch": (
                 "cloudwatch",
                 [raw_cache_path("jobs", str(job_id), "cloudwatch", "cursor.json") for job_id in jobs_for_progress],
@@ -121,7 +126,7 @@ async def collect_report_from_raw_cache(
             query_diagnostics[query_key] = {
                 "key": query_key,
                 "label": QUERY_LABELS[query_key],
-                "status": "error" if error else "ok",
+                "status": source.get("status", "ok") if query_key == "kev_laya" else ("error" if error else "ok"),
                 "summary": error or f"Cached in {len(existing_paths)} raw file(s)",
                 "updated_at": manifest.get("updated_at"),
                 "duration_seconds": source.get("duration_seconds"),
@@ -196,6 +201,9 @@ async def collect_report_from_raw_cache(
     records.extend(
         build_cluster_record(cluster, args.zymtrace_project_id) for cluster in clusters
     )
+    model_runs_report = build_model_runs_report(
+        cached_kev_laya_runs(), jobs, namespace=os.environ.get("OVERWATCH_SKY_NAMESPACE")
+    )
     records.sort(
         key=lambda record: (
             record["status"]["skypilot"] in ACTIVE_RESOURCE_STATUSES,
@@ -211,6 +219,8 @@ async def collect_report_from_raw_cache(
         "log_enrichment": not args.no_log_enrichment,
         "billing": billing,
         "resources": records,
+        "model_runs": model_runs_report["runs"],
+        "model_run_warnings": model_runs_report["warnings"],
         "config_differences": config_differences(matched_records, matched_configs),
         "warnings": billing["warnings"],
         "raw_cache_root": manifest.get("cache_root"),

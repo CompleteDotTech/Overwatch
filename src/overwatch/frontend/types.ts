@@ -1,3 +1,5 @@
+import type { ModelRun } from "./modelRuns";
+
 export interface BillingDay {
   date: string;
   [series: string]: string | number | null;
@@ -141,6 +143,8 @@ export interface Report {
   raw_cache_root?: string;
   billing: Billing;
   resources: Resource[];
+  model_runs?: ModelRun[];
+  model_run_warnings?: Array<Record<string, unknown>>;
   config_differences: ConfigDifference[];
   warnings: string[];
 }

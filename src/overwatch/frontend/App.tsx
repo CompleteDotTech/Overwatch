@@ -1,3 +1,4 @@
+import { ModelRuns } from "./ModelRunsView";
 import {
   ActionIcon,
   Alert,
@@ -1009,7 +1010,7 @@ export function App() {
             </Stack>
           </Center>
         )}
-        {report && page === "resources" && <ResourcesPage report={report} />}
+        {report && page === "resources" && <><ResourcesPage report={report} /><ModelRuns runs={report.model_runs ?? []} warnings={report.model_run_warnings ?? []} /></>}
         {report && page === "billing" && <BillingPage report={report} />}
         {report && page === "cost-waste" && <CostWastePage report={report} />}
         {report && page === "run" && runJobId != null && <RunPage report={report} jobId={runJobId} />}

@@ -57,6 +57,7 @@ class CollectorOptions:
     limit: int = 20
     entity: str | None = None
     gcp_billing_table: str | None = None
+    local_models_only: bool = False
 
 
 
@@ -194,6 +195,29 @@ async def collect_raw_metrics(
         }
         return value
 
+    # Explicit offline/local mode: use the REAL collector and cache without cloud I/O.
+    # Default behavior and existing Flow/resource records remain unchanged.
+    if options.local_models_only:
+        if job_id is not None:
+            raise ValueError("local-models-only cannot refresh a SkyPilot job")
+        result = await collect_source("kev_laya", collect_kev_laya_cache)
+        if result is not None:
+            source_status["kev_laya"]["raw"] = result
+            if result["warnings"]:
+                source_status["kev_laya"]["status"] = "warning"
+        for key in ("sky_jobs", "sky_clusters", "aws_billing", "gcp_billing", "wandb", "cloudwatch"):
+            source_status[key] = {"status": "skipped", "duration_seconds": 0.0,
+                                  "error": None, "reason": "explicit local-models-only"}
+        manifest = {
+            "cache_spec_version": RAW_CACHE_SPEC_VERSION, "cache_root": str(RAW_CACHE_ROOT),
+            "updated_at": isoformat(datetime.now(UTC)),
+            "duration_seconds": round(perf_counter() - collection_started, 3),
+            "scope": {"job_id": None, "full_logs": False, "local_models_only": True},
+            "sources": source_status,
+        }
+        write_json_atomically(manifest_path, manifest)
+        return manifest
+
     # A scoped job refresh reuses inventory and only advances that job's raw log cursor.
     if job_id is not None:
         job = read_json(raw_cache_path("jobs", str(job_id), "sky.json"))
@@ -252,6 +276,12 @@ async def collect_raw_metrics(
                 "duration_seconds": 0.0,
                 "error": None,
             }
+
+        kev_laya_result = await collect_source("kev_laya", collect_kev_laya_cache)
+        if kev_laya_result is not None:
+            source_status["kev_laya"]["raw"] = kev_laya_result
+            if kev_laya_result["warnings"]:
+                source_status["kev_laya"]["status"] = "warning"
 
         # W&B stays optional and is captured as raw hydrated run records.
         wandb_started = perf_counter()
@@ -393,10 +423,35 @@ async def collect_raw_metrics(
     return manifest
 
 
+
+def collect_kev_laya_cache() -> dict[str, Any]:
+    """The collector alone owns Kev-Laya raw-cache writes."""
+    from overwatch.kev_laya_adapter import merge_snapshots
+    from overwatch.providers.kev_laya import collect_snapshots
+    from overwatch.raw_cache import model_runs_cache_path
+    from overwatch.constants import KEV_LAYA_RETENTION_DAYS
+    from overwatch.kev_laya_lock import collector_lock
+
+    path = model_runs_cache_path()
+    collected = collect_snapshots()
+    with collector_lock(path.with_suffix(".lock")):
+        from overwatch.raw_cache import read_model_runs_cache
+        envelope = merge_snapshots(read_model_runs_cache(), collected,
+                                   retention_days=KEV_LAYA_RETENTION_DAYS)
+        write_json_atomically(path, envelope)
+    return {"runs": len(envelope["records"]), "warnings": len(envelope["warnings"]),
+            "complete": collected.get("complete", False),
+            "accounting": collected.get("accounting", {}),
+            "source_status": collected.get("sources", []),
+            "collection_warnings": collected.get("warnings", [])}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Collect raw Overwatch metrics")
     parser.add_argument("--job-id", type=int)
     parser.add_argument("--full-logs", action="store_true")
+    parser.add_argument("--local-models-only", action="store_true",
+                        default=os.environ.get("OVERWATCH_LOCAL_MODELS_ONLY") == "1")
     parser.add_argument("--limit", type=int, default=20)
     parser.add_argument("--entity")
     parser.add_argument(
@@ -411,6 +466,7 @@ def main() -> int:
         limit=args.limit,
         entity=args.entity,
         gcp_billing_table=args.gcp_billing_table,
+        local_models_only=args.local_models_only,
     )
     manifest = asyncio.run(
         collect_raw_metrics(options, job_id=args.job_id, full_logs=args.full_logs)

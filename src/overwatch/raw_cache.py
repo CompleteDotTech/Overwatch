@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import math
 import shutil
 import tempfile
@@ -15,7 +16,7 @@ from loguru import logger
 
 from overwatch.utils import isoformat
 
-RAW_CACHE_ROOT = Path.home() / ".cache" / "overwatch" / "raw-v1"
+RAW_CACHE_ROOT = Path(os.environ.get("OVERWATCH_RAW_CACHE_ROOT", str(Path.home() / ".cache" / "overwatch" / "raw-v1"))).expanduser()
 
 
 def raw_cache_path(*parts: str) -> Path:
@@ -108,3 +109,24 @@ def read_json(path: Path, default: Any = None) -> Any:
     except (OSError, json.JSONDecodeError) as error:
         logger.warning("Ignoring unreadable cache snapshot {}: {}", path, error)
         return default
+
+
+def model_runs_cache_path() -> Path:
+    """Dedicated versioned model cache; legacy raw-v1 resources are unchanged."""
+    return raw_cache_path("global", "kev_laya", "runs-v2.json")
+
+
+def read_model_runs_cache() -> dict:
+    """Cache-only migration read. Never reread producer exports during rendering.
+
+    Existing v1 files are immutable migration inputs; the collector writes v2.
+    A corrupt v2 does NOT silently roll the current view back to an old v1.
+    """
+    path = model_runs_cache_path()
+    if not path.exists():
+        path = raw_cache_path("global", "kev_laya", "runs-v1.json")
+    value = read_json(path)
+    if isinstance(value, dict) and isinstance(value.get("schema_version"), str) and value["schema_version"] in {"kev_laya/raw/1", "kev_laya/raw/2"}:
+        return value
+    warning = [{"code": "model_run_cache_unreadable_or_incompatible", "source": "cache"}] if path.exists() else []
+    return {"schema_version": "kev_laya/raw/2", "records": [], "observations": [], "warnings": warning}
