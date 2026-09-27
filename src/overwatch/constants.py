@@ -60,3 +60,7 @@ TRAIN_PROGRESS_RE = re.compile(
     r"\[(?P<elapsed>[^<\]]+)<(?P<remaining>.+?)\s+[\d.eE+-]+ex/s "
     r"(?P<tokens_per_second>[\d,]+)tok/s"
 )
+
+# Kev-Laya adapter policy; does not change Flow/cloud log defaults.
+KEV_LAYA_STALE_SECONDS = 120
+KEV_LAYA_RETENTION_DAYS = 14

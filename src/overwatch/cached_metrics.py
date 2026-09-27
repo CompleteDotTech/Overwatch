@@ -680,3 +680,10 @@ def cached_cloudwatch_log_page(
 def raw_cache_manifest() -> dict[str, Any]:
     """Load the collector manifest used for query status and cache provenance."""
     return read_json(raw_cache_path("manifest.json"), {"sources": {}, "cache_root": str(RAW_CACHE_ROOT)})
+
+
+def cached_kev_laya_runs() -> dict[str, Any]:
+    """Read model-run snapshots strictly from the versioned collector cache."""
+    from overwatch.raw_cache import read_model_runs_cache
+
+    return read_model_runs_cache()
