@@ -211,8 +211,15 @@ class WandbPages:
         auth = base64.b64encode(('api:' + token).encode()).decode()
         response = build_opener(NoRedirects()).open(Request(base + '/graphql', data=body,
                        headers={'Authorization': 'Basic ' + auth, 'Content-Type': 'application/json', 'Accept-Encoding': 'identity'}), timeout=timeout)
-        length = response.headers.get('Content-Length')
-        return {'Body': response, 'ContentLength': int(length) if length is not None else None}
+        # Until the body is returned, this method owns it. Header failures must
+        # not leak an unread response outside the collector's cleanup scope.
+        try:
+            length = response.headers.get('Content-Length')
+            declared_length = int(length) if length is not None else None
+        except BaseException:
+            response.close()
+            raise
+        return {'Body': response, 'ContentLength': declared_length}
 
 
 def collect_snapshots(path: Path | None = None, *, wandb_api=None, s3_client=None,
@@ -297,6 +304,16 @@ def collect_snapshots(path: Path | None = None, *, wandb_api=None, s3_client=Non
                     edges = runs['edges']
                     if not isinstance(edges, list) or len(edges) > first:
                         raise ValueError('W&B page exceeded requested node count')
+                    page_info = runs.get('pageInfo')
+                    if not isinstance(page_info, dict) or type(page_info.get('hasNextPage')) is not bool:
+                        raise ValueError('invalid W&B page completion flag')
+                    has_next = page_info['hasNextPage']
+                    next_cursor = page_info.get('endCursor')
+                    if has_next and (not isinstance(next_cursor, str) or not next_cursor
+                                     or next_cursor in seen or not edges):
+                        raise ValueError('invalid or repeating W&B cursor')
+                    # Validate page completeness before accepting this page's
+                    # records. Prior valid pages remain available on failure.
                     for edge in edges:
                         node = edge['node']
                         summary = node['summaryMetrics']
@@ -308,11 +325,9 @@ def collect_snapshots(path: Path | None = None, *, wandb_api=None, s3_client=Non
                             identity = {'entity': source['entity'], 'project': source['project'], 'run_id': node['name']}
                             # Entire containing response was already charged; do not double count.
                             append(json.dumps(snapshot, allow_nan=False, ensure_ascii=False).encode(), source, node['state'], identity)
-                    if not runs['pageInfo']['hasNextPage']:
+                    if not has_next:
                         break
-                    cursor = runs['pageInfo']['endCursor']
-                    if not isinstance(cursor, str) or not cursor or cursor in seen or not edges:
-                        raise ValueError('invalid or repeating W&B cursor')
+                    cursor = next_cursor
                     seen.add(cursor)
                     if count >= source['limit']:
                         status = 'partial_limit'
