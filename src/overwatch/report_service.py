@@ -45,11 +45,11 @@ async def collect_report_from_raw_cache(
         cached_billing_report,
         cached_cloudwatch_retry_breakdown,
         cached_cloudwatch_telemetry,
+        cached_kev_laya_runs,
         cached_sky_clusters,
         cached_sky_jobs,
         cached_train_config,
         cached_wandb_runs,
-        cached_kev_laya_runs,
         raw_cache_manifest,
     )
     from overwatch.collector import CollectorOptions, collect_raw_metrics

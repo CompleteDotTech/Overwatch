@@ -1,7 +1,7 @@
 """Cross-process cache transaction lock; separate from the trainer's atomic export."""
 
-from contextlib import contextmanager
 import os
+from contextlib import contextmanager
 from pathlib import Path
 
 

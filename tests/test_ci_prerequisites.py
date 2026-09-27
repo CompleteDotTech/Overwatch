@@ -2,9 +2,9 @@
 from __future__ import annotations
 
 import importlib.util
-from pathlib import Path
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 import yaml
@@ -61,7 +61,7 @@ def test_cli_missing_prerequisites_is_nonzero_and_secret_safe():
     for key in ("GITHUB_REPOSITORY", "OVERWATCH_CI_HEAD_REPOSITORY", "UV_INDEX_TSCORE_PASSWORD"):
         env.pop(key, None)
     result = subprocess.run([sys.executable, str(ROOT / "scripts/ci_prerequisites.py"), "--ci"],
-                            env=env, text=True, capture_output=True, timeout=10)
+                            env=env, text=True, capture_output=True, timeout=10, check=False)
     assert result.returncode == 2
     assert "missing_authorized_tscore_index_token" in result.stdout
     assert not result.stderr

@@ -1,11 +1,13 @@
 """Versioned run identity/ordering merge and cache-only presentation. No provider I/O."""
 from __future__ import annotations
+
 import copy
-from datetime import datetime, timezone
 import hashlib
 import json
+from datetime import UTC, datetime
 from urllib.parse import urlsplit
-from overwatch.kev_laya_contract import validate_snapshot, timestamp
+
+from overwatch.kev_laya_contract import timestamp, validate_snapshot
 
 CACHE_VERSION = "kev_laya/raw/2"
 READABLE_CACHE_VERSIONS = {"kev_laya/raw/1", CACHE_VERSION}
@@ -32,7 +34,7 @@ def merge_snapshots(previous: dict | None, collected: dict, *, now: datetime | N
     The collector owns this envelope. No exporter, network call, or directory walk
     is made here. Missing/partial registries are not implicit revocations.
     """
-    now = now or datetime.now(timezone.utc)
+    now = now or datetime.now(UTC)
     warnings = list(collected.get("warnings", []))
     if previous is not None and not _readable_cache_envelope(previous):
         warnings.append({"code": "unsupported_prior_cache_version"})
@@ -54,7 +56,7 @@ def merge_snapshots(previous: dict | None, collected: dict, *, now: datetime | N
             sources = sorted(set(rec["source_ids"]) & allowed)
             age = (now - timestamp(snapshot["heartbeat_at"])).total_seconds()
             if not isinstance(rec.get("provider_status"), dict) or not isinstance(rec.get("transports"), list):
-                raise ValueError("invalid cache wrapper")
+                raise ValueError("invalid cache wrapper")  # noqa: TRY004 - Preserve cache warning contract.
             if sources and age <= retention_days * 86400:
                 records[key(snapshot)] = copy.deepcopy(rec) | {"source_ids": sources}
         except (ValueError, KeyError, TypeError):
@@ -131,9 +133,7 @@ def merge_snapshots(previous: dict | None, collected: dict, *, now: datetime | N
                     code = "heartbeat_regression"
                 elif any(snap["progress"][k] < current["progress"][k] for k in ("optimizer_steps", "microbatches", "examples", "forward_tokens")):
                     code = "progress_regression"
-                elif any(snap[k] != current[k] for k in ("started_at", "provenance", "scheduler", "wandb")):
-                    code = "attempt_metadata_conflict"
-                elif current.get("extensions") and any(snap.get("extensions", {}).get(k) != current["extensions"].get(k)
+                elif any(snap[k] != current[k] for k in ("started_at", "provenance", "scheduler", "wandb")) or current.get("extensions") and any(snap.get("extensions", {}).get(k) != current["extensions"].get(k)
                                                         for k in ("source", "serialization", "attempt_lineage")):
                     code = "attempt_metadata_conflict"
                 elif current["phase"] in {"completed", "failed", "cancelled"} and snap["phase"] != current["phase"]:
@@ -217,7 +217,7 @@ def verified_attempt_transition(current: dict | None, candidate: dict) -> bool:
 def presentation(envelope: dict, jobs: list | None = None, *, namespace: str | None = None,
                  now: datetime | None = None, stale_seconds=120) -> dict:
     """Interpret only already cached records. Sky status is authoritative, never inferred."""
-    now = now or datetime.now(timezone.utc)
+    now = now or datetime.now(UTC)
     if not _readable_cache_envelope(envelope):
         return {"runs": [], "warnings": [{"code": "missing_or_invalid_model_run_cache"}]}
     jobs = jobs or []
@@ -240,7 +240,7 @@ def presentation(envelope: dict, jobs: list | None = None, *, namespace: str | N
         try:
             snap = validate_snapshot(rec["snapshot"], now=now)
             if not isinstance(rec.get("provider_status"), dict) or not isinstance(rec.get("source_ids"), list) or not isinstance(rec.get("transports"), list):
-                raise ValueError("invalid cached wrapper")
+                raise ValueError("invalid cached wrapper")  # noqa: TRY004 - Preserve cache warning contract.
         except (ValueError, KeyError, TypeError):
             warnings.append({"code": "invalid_cached_snapshot"})
             continue

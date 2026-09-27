@@ -426,11 +426,11 @@ async def collect_raw_metrics(
 
 def collect_kev_laya_cache() -> dict[str, Any]:
     """The collector alone owns Kev-Laya raw-cache writes."""
+    from overwatch.constants import KEV_LAYA_RETENTION_DAYS
     from overwatch.kev_laya_adapter import merge_snapshots
+    from overwatch.kev_laya_lock import collector_lock
     from overwatch.providers.kev_laya import collect_snapshots
     from overwatch.raw_cache import model_runs_cache_path
-    from overwatch.constants import KEV_LAYA_RETENTION_DAYS
-    from overwatch.kev_laya_lock import collector_lock
 
     path = model_runs_cache_path()
     collected = collect_snapshots()

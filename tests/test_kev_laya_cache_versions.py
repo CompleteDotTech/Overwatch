@@ -1,13 +1,13 @@
 """Direct adapter boundary tests; these are synthetic cache data, not live telemetry."""
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
 from overwatch.kev_laya_adapter import CACHE_VERSION, merge_snapshots, presentation
 from overwatch.kev_laya_contract import validate_snapshot
 
-NOW = datetime(2026, 9, 27, 0, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 9, 27, 0, 0, tzinfo=UTC)
 BAD_VERSIONS = [[], {}, None, True, False, 1, 2.0, "", "kev_laya/raw/3"]
 
 

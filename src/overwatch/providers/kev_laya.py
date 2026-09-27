@@ -6,18 +6,20 @@ TLS, headers, SDK credential discovery and other opaque transport overhead are
 not claimed as measured payload. No implicit SDK pagination or retry loops.
 """
 from __future__ import annotations
+
 import base64
-from dataclasses import dataclass
-from datetime import datetime, timezone
 import json
 import math
 import os
-from pathlib import Path
 import stat
 import time
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
-from urllib.request import Request, build_opener, HTTPRedirectHandler
+from urllib.request import HTTPRedirectHandler, Request, build_opener
+
 from overwatch.kev_laya_contract import MAX_SNAPSHOT_BYTES, decode_snapshot, identifier
 
 MAX_SOURCES = 512
@@ -83,7 +85,7 @@ class Budget:
             self.reads += 1
             raw = stream.read(count)
             if not isinstance(raw, bytes):
-                raise ValueError('transport violated byte-read contract')
+                raise ValueError('transport violated byte-read contract')  # noqa: TRY004 - Preserve transport error contract.
             self.bytes += len(raw)  # Charge even a misbehaving injected transport; do not hide actual I/O.
             if len(raw) > count:
                 raise ValueError('transport violated bounded byte-read contract')
@@ -131,7 +133,7 @@ def validate_registry(registry):
     seen = set()
     for source in sources:
         if not isinstance(source, dict):
-            raise ValueError('registry source must be an object')
+            raise ValueError('registry source must be an object')  # noqa: TRY004 - Preserve registry error contract.
         source_id = source.get('id')
         identifier(source_id, 'source ID')
         if source_id in seen:
@@ -240,7 +242,7 @@ def collect_snapshots(path: Path | None = None, *, wandb_api=None, s3_client=Non
     budget = Budget(limits, clock, started=started)
     cached_s3_client = s3_client
     records, warnings, statuses = [], [], []
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     stop_reason = None
 
     def append(raw, source, provider_status=None, wb_identity=None):
@@ -336,7 +338,7 @@ def collect_snapshots(path: Path | None = None, *, wandb_api=None, s3_client=Non
             stop_reason = str(exc)
             status = 'partial_' + stop_reason if len(records) > before_records else 'skipped_' + stop_reason
             warnings.append({'source_id': source_id, 'code': stop_reason})
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - A failed source must not stop collection of other sources.
             status, error_type = 'error', type(exc).__name__
             warnings.append({'source_id': source_id, 'code': 'source_unavailable_or_invalid', 'error_type': error_type})
         statuses.append({'source_id': source_id, 'status': status, 'payload_bytes': budget.bytes - before_bytes,

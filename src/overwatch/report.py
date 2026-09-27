@@ -555,8 +555,8 @@ def build_cluster_record(cluster: Any, zymtrace_project_id: str) -> dict[str, An
 
 def build_model_runs_report(envelope: dict, jobs: list, *, namespace: str | None = None) -> dict:
     """Dedicated model records; no invented scheduler resources or Flow counters."""
-    from overwatch.kev_laya_adapter import presentation
     from overwatch.constants import KEV_LAYA_STALE_SECONDS
+    from overwatch.kev_laya_adapter import presentation
 
     return presentation(envelope, jobs, namespace=namespace,
                         stale_seconds=KEV_LAYA_STALE_SECONDS)

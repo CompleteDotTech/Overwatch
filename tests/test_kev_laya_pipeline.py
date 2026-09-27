@@ -10,8 +10,9 @@ import hashlib
 import importlib
 import json
 import os
-from pathlib import Path
 import sys
+from pathlib import Path
+
 import pytest
 
 
@@ -21,9 +22,9 @@ def test_real_export_through_collector_cache_and_report(tmp_path, monkeypatch):
     source = os.environ.get('KEV_LAYA_SNAPSHOT')
     if not source:
         pytest.skip('set KEV_LAYA_SNAPSHOT to a fresh real training export with checkpoint/evaluation artifacts')
-    from overwatch import collector, raw_cache, cached_metrics
-    from overwatch.report_service import collect_report_from_raw_cache
+    from overwatch import cached_metrics, collector, raw_cache
     from overwatch.kev_laya_contract import decode_snapshot
+    from overwatch.report_service import collect_report_from_raw_cache
     original = Path(source).resolve()
     raw = original.read_bytes()
     snapshot = decode_snapshot(raw)

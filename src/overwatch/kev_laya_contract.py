@@ -4,11 +4,12 @@ Copyright 2026 Kev-Laya contributors. SPDX-License-Identifier: Apache-2.0
 No imports from the model, torch, training, cloud SDKs or Overwatch.
 """
 from __future__ import annotations
+
 import hashlib
 import json
 import math
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from urllib.parse import urlsplit
 
 SCHEMA_VERSION = 2
@@ -59,11 +60,11 @@ def fields(obj, allowed, required=None):
 def timestamp(value):
     require(isinstance(value, str) and len(value) <= 40, "invalid timestamp")
     try:
-        result = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        result = datetime.fromisoformat(value)
     except ValueError as exc:
         raise TelemetryError("invalid timestamp") from exc
     require(result.tzinfo is not None and result.utcoffset() is not None, "timezone required")
-    return result.astimezone(timezone.utc)
+    return result.astimezone(UTC)
 
 
 def uri(value):

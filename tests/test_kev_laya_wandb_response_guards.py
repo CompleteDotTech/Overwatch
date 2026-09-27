@@ -1,10 +1,10 @@
 """Synthetic transport regressions; no live W&B, SDK, model, or UI qualification."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
 import io
 import json
 import socket
+from datetime import UTC, datetime
 from urllib.error import URLError
 
 import pytest
@@ -25,7 +25,7 @@ def no_network(monkeypatch):
 
 
 def snapshot(run_id='run-1', sequence=1):
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     result = {
         'schema_version': 1, 'framework': 'kev_laya', 'framework_version': 'test',
         'experiment_id': 'synthetic-test', 'run_id': run_id, 'attempt_id': 'attempt-0',
