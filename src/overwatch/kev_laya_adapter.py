@@ -11,6 +11,13 @@ CACHE_VERSION = "kev_laya/raw/2"
 READABLE_CACHE_VERSIONS = {"kev_laya/raw/1", CACHE_VERSION}
 
 
+def _readable_cache_envelope(envelope: object) -> bool:
+    """Guard the version before set membership: cache JSON may contain any type."""
+    return (isinstance(envelope, dict)
+            and isinstance(envelope.get("schema_version"), str)
+            and envelope["schema_version"] in READABLE_CACHE_VERSIONS)
+
+
 def key(snapshot: dict) -> str:
     return snapshot["experiment_id"] + "\0" + snapshot["run_id"]
 
@@ -27,10 +34,10 @@ def merge_snapshots(previous: dict | None, collected: dict, *, now: datetime | N
     """
     now = now or datetime.now(timezone.utc)
     warnings = list(collected.get("warnings", []))
-    previous = previous if isinstance(previous, dict) else {}
-    if previous and previous.get("schema_version") not in READABLE_CACHE_VERSIONS:
+    if previous is not None and not _readable_cache_envelope(previous):
         warnings.append({"code": "unsupported_prior_cache_version"})
-        previous = {}
+        previous = None
+    previous = previous if previous is not None else {}
     prior_records = previous.get("records", [])
     if not isinstance(prior_records, list):
         prior_records = []
@@ -211,7 +218,7 @@ def presentation(envelope: dict, jobs: list | None = None, *, namespace: str | N
                  now: datetime | None = None, stale_seconds=120) -> dict:
     """Interpret only already cached records. Sky status is authoritative, never inferred."""
     now = now or datetime.now(timezone.utc)
-    if not isinstance(envelope, dict) or envelope.get("schema_version") not in READABLE_CACHE_VERSIONS:
+    if not _readable_cache_envelope(envelope):
         return {"runs": [], "warnings": [{"code": "missing_or_invalid_model_run_cache"}]}
     jobs = jobs or []
     index = {}
